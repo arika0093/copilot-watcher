@@ -12,7 +12,7 @@ type Config struct {
 }
 
 func DefaultConfig() Config {
-	return Config{Language: "Japanese", Format: "conversational"}
+	return Config{Language: defaultLanguage(), Format: "conversational"}
 }
 
 var configPathFn = configPath
@@ -30,27 +30,28 @@ func configPath() (string, error) {
 }
 
 func Load() (Config, error) {
+	defaults := DefaultConfig()
 	p, err := configPathFn()
 	if err != nil {
-		return DefaultConfig(), err
+		return defaults, err
 	}
 	f, err := os.Open(p)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return DefaultConfig(), nil
+			return defaults, nil
 		}
-		return DefaultConfig(), err
+		return defaults, err
 	}
 	defer f.Close()
 	var c Config
 	if err := json.NewDecoder(f).Decode(&c); err != nil {
-		return DefaultConfig(), err
+		return defaults, err
 	}
 	if c.Language == "" {
-		c.Language = "Japanese"
+		c.Language = defaults.Language
 	}
 	if c.Format == "" {
-		c.Format = "conversational"
+		c.Format = defaults.Format
 	}
 	return c, nil
 }

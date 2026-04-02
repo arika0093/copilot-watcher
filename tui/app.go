@@ -27,6 +27,7 @@ type AppModel struct {
 	sessionWatcher *session.StateWatcher
 	trans          *translator.Translator
 	outputLang     string
+	outputFormat   string
 	width          int
 	height         int
 	fatalErr       error
@@ -136,11 +137,12 @@ func waitForSessionWatcherErr(ch <-chan error) tea.Cmd {
 func NewAppModel() *AppModel {
 	cfg, _ := config.Load()
 	return &AppModel{
-		screen:     screenSelector,
-		selector:   NewSelectorModel(),
-		outputLang: cfg.Language,
-		settings:   NewSettingsModel(cfg.Language, cfg.Format),
-		sdkLogCh:   make(chan string, 64),
+		screen:       screenSelector,
+		selector:     NewSelectorModel(),
+		outputLang:   cfg.Language,
+		outputFormat: cfg.Format,
+		settings:     NewSettingsModel(cfg.Language, cfg.Format),
+		sdkLogCh:     make(chan string, 64),
 	}
 }
 
@@ -242,6 +244,12 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.selector.err = fmt.Errorf("Copilot SDK init failed after 5 attempts: %v", msg.err)
 		} else {
 			m.trans = msg.trans
+			if m.outputLang != "" {
+				m.trans.SetLanguage(m.outputLang)
+			}
+			if m.outputFormat != "" {
+				m.trans.SetFormat(m.outputFormat)
+			}
 			// If a session was pending, open it now
 			if m.pendingSession != nil {
 				pending := m.pendingSession
@@ -250,8 +258,8 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.screen = screenViewer
 				vm := NewViewerModel(*pending, m.trans)
 				vm.width, vm.height = m.width, m.height
-				vm.outputLang = m.trans.GetLanguage()
-				vm.outputFormat = m.trans.GetFormat()
+				vm.outputLang = m.outputLang
+				vm.outputFormat = m.outputFormat
 				m.viewer = &vm
 				return m, tea.Batch(
 					m.viewer.Init(),
@@ -312,8 +320,8 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.screen = screenViewer
 		vm := NewViewerModel(msg.Session, m.trans)
 		vm.width, vm.height = m.width, m.height
-		vm.outputLang = m.trans.GetLanguage()
-		vm.outputFormat = m.trans.GetFormat()
+		vm.outputLang = m.outputLang
+		vm.outputFormat = m.outputFormat
 		m.viewer = &vm
 		return m, tea.Batch(
 			m.viewer.Init(),
@@ -348,10 +356,7 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.trans != nil {
 			m.trans.SetLanguage(msg.Lang)
 		}
-		currentFmt := "bullets"
-		if m.trans != nil {
-			currentFmt = m.trans.GetFormat()
-		}
+		currentFmt := m.outputFormat
 		m.settings = NewSettingsModel(msg.Lang, currentFmt)
 		// persist
 		_ = config.Save(config.Config{Language: msg.Lang, Format: currentFmt})
@@ -363,6 +368,7 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case FormatChangedMsg:
+		m.outputFormat = msg.Format
 		if m.trans != nil {
 			m.trans.SetFormat(msg.Format)
 		}

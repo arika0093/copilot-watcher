@@ -113,7 +113,7 @@ type ViewerModel struct {
 	rtGeneration int
 	rtCh         <-chan string
 	rtCancel     context.CancelFunc
-	rtStreamMode bool // false = turn-by-turn mode, true = streaming (live) mode
+	rtStreamMode bool // false = turn-to-turn mode, true = streaming (live) mode
 
 	// History: Turns tab (per-request of the current session)
 	hsTurns      []*viewTurn
@@ -128,7 +128,7 @@ type ViewerModel struct {
 	haCh     <-chan string
 	haCancel context.CancelFunc
 
-	// Scroll state per tab (line index from top, 0 = newest)
+	// Scroll state per tab as distance from the latest line at the bottom.
 	scroll map[TabID]int
 
 	width        int
@@ -156,8 +156,62 @@ func NewViewerModel(info session.SessionInfo, trans *translator.Translator) View
 		statusOK:     false,
 		outputLang:   trans.GetLanguage(),
 		outputFormat: trans.GetFormat(),
-		rtStreamMode: true,
+		rtStreamMode: false,
 	}
+}
+
+func (m ViewerModel) contentHeight() int {
+	h := m.height
+	if h <= 0 {
+		h = 40
+	}
+	contentH := h - 5
+	if contentH < 3 {
+		contentH = 3
+	}
+	return contentH
+}
+
+func (m ViewerModel) panelContentWidth() int {
+	w := m.width
+	if w <= 0 {
+		w = 100
+	}
+	panelContentW := w - 4
+	if panelContentW < 20 {
+		panelContentW = 20
+	}
+	return panelContentW
+}
+
+func (m ViewerModel) maxScrollOffset() int {
+	allLines := m.buildTabLines(m.panelContentWidth())
+	maxOffset := len(allLines) - m.contentHeight()
+	if maxOffset < 0 {
+		return 0
+	}
+	return maxOffset
+}
+
+func (m *ViewerModel) scrollOlder() {
+	maxOffset := m.maxScrollOffset()
+	if m.scroll[m.activeTab] < maxOffset {
+		m.scroll[m.activeTab]++
+	}
+}
+
+func (m *ViewerModel) scrollNewer() {
+	if m.scroll[m.activeTab] > 0 {
+		m.scroll[m.activeTab]--
+	}
+}
+
+func (m *ViewerModel) scrollToOldest() {
+	m.scroll[m.activeTab] = m.maxScrollOffset()
+}
+
+func (m *ViewerModel) scrollToLatest() {
+	m.scroll[m.activeTab] = 0
 }
 
 func (m ViewerModel) Init() tea.Cmd {
@@ -842,11 +896,9 @@ func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
 	case tea.MouseMsg:
 		switch msg.Button {
 		case tea.MouseButtonWheelUp:
-			if m.scroll[m.activeTab] > 0 {
-				m.scroll[m.activeTab]--
-			}
+			m.scrollOlder()
 		case tea.MouseButtonWheelDown:
-			m.scroll[m.activeTab]++
+			m.scrollNewer()
 		}
 
 	case tea.KeyMsg:
@@ -880,30 +932,28 @@ func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
 		case "m":
 			if m.activeTab == TabRealtime {
 				m.rtStreamMode = !m.rtStreamMode
-				m.scroll[m.activeTab] = 0
+				m.scrollToLatest()
 				if m.rtStreamMode {
 					m.debugLog = append(m.debugLog, dbgf("RT mode switched to streaming (live)"))
 				} else {
-					m.debugLog = append(m.debugLog, dbgf("RT mode switched to turn-by-turn"))
+					m.debugLog = append(m.debugLog, dbgf("RT mode switched to turn-to-turn"))
 				}
 			}
 		case "up", "k":
-			if m.scroll[m.activeTab] > 0 {
-				m.scroll[m.activeTab]--
-			}
+			m.scrollOlder()
 		case "down", "j":
-			m.scroll[m.activeTab]++
+			m.scrollNewer()
 		case "left":
 			switch m.activeTab {
 			case TabRealtime:
 				if m.rtCursor < len(m.rtTurns)-1 {
 					m.rtCursor++
-					m.scroll[m.activeTab] = 0
+					m.scrollToLatest()
 				}
 			case TabHistorySessions:
 				if m.hsCursor < len(m.hsTurns)-1 {
 					m.hsCursor++
-					m.scroll[m.activeTab] = 0
+					m.scrollToLatest()
 					if m.trans != nil {
 						return m, m.startHSAtCursor()
 					}
@@ -914,21 +964,21 @@ func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
 			case TabRealtime:
 				if m.rtCursor > 0 {
 					m.rtCursor--
-					m.scroll[m.activeTab] = 0
+					m.scrollToLatest()
 				}
 			case TabHistorySessions:
 				if m.hsCursor > 0 {
 					m.hsCursor--
-					m.scroll[m.activeTab] = 0
+					m.scrollToLatest()
 					if m.trans != nil {
 						return m, m.startHSAtCursor()
 					}
 				}
 			}
 		case "G":
-			m.scroll[m.activeTab] = 999999
+			m.scrollToLatest()
 		case "g":
-			m.scroll[m.activeTab] = 0
+			m.scrollToOldest()
 		}
 	}
 	return m, nil
@@ -975,10 +1025,6 @@ func (m ViewerModel) View() string {
 	header := HeaderStyle.Width(w).Render(leftStr + strings.Repeat(" ", pad) + rightStr)
 	sb.WriteString(header + "\n")
 
-	// ── Tab bar ───────────────────────────────────────────────────────────────
-	tabBar := m.renderTabBar(w)
-	sb.WriteString(tabBar + "\n")
-
 	// ── Init log (shown only during initialization) ────────────────────────────
 	if !m.ready {
 		var logLines []string
@@ -1004,36 +1050,10 @@ func (m ViewerModel) View() string {
 	}
 
 	// ── Main content panel ────────────────────────────────────────────────────
-	// height budget: header(1) + tabbar(1) + panelBorderTop(1) + panelBorderBot(1) + help(1) = 5
-	contentH := h - 5
-	if contentH < 3 {
-		contentH = 3
-	}
-
-	panelContentW := w - 4
-	if panelContentW < 20 {
-		panelContentW = 20
-	}
-
+	contentH := m.contentHeight()
+	panelContentW := m.panelContentWidth()
 	allLines := m.buildTabLines(panelContentW)
-
-	offset := m.scroll[m.activeTab]
-	maxOffset := len(allLines) - contentH
-	if maxOffset < 0 {
-		maxOffset = 0
-	}
-	if offset > maxOffset {
-		offset = maxOffset
-	}
-	end := offset + contentH
-	if end > len(allLines) {
-		end = len(allLines)
-	}
-	var visible []string
-	if len(allLines) > 0 {
-		visible = allLines[offset:end]
-	}
-
+	visible, _, start, end := visibleLinesFromBottom(allLines, contentH, m.scroll[m.activeTab])
 	content := strings.Join(visible, "\n")
 	panelTitle := m.buildPanelTitle()
 	sb.WriteString(renderPanel(panelTitle, content, w))
@@ -1042,13 +1062,18 @@ func (m ViewerModel) View() string {
 	// ── Help bar ──────────────────────────────────────────────────────────────
 	scrollInfo := ""
 	if len(allLines) > contentH {
-		scrollInfo = fmt.Sprintf("   [%d/%d lines]", offset+1, len(allLines))
+		scrollInfo = fmt.Sprintf("   [lines %d-%d/%d]", start+1, end, len(allLines))
 	}
 	help := HelpStyle.Render(fmt.Sprintf(
 		"  [q] back   [1-4] tab   [↑↓/kj] scroll   [g/G] top/bottom   [esc] quit%s",
 		scrollInfo,
 	))
 	sb.WriteString(help)
+	sb.WriteString("\n")
+
+	// ── Tab bar ───────────────────────────────────────────────────────────────
+	tabBar := m.renderTabBar(w)
+	sb.WriteString(tabBar)
 	return sb.String()
 }
 
@@ -1115,7 +1140,7 @@ func (m ViewerModel) buildPanelTitle() string {
 	return title + " "
 }
 
-// buildTabLines builds all displayable lines for the active tab (newest first).
+// buildTabLines builds display lines for the active tab in reading order.
 func (m ViewerModel) buildTabLines(w int) []string {
 	switch m.activeTab {
 	case TabRealtime:
@@ -1132,7 +1157,7 @@ func (m ViewerModel) buildTabLines(w int) []string {
 
 func (m ViewerModel) buildRTLines(w int) []string {
 	if len(m.rtTurns) == 0 {
-		modeLine := MutedStyle.Render("  Mode: [m] turn-by-turn")
+		modeLine := MutedStyle.Render("  Mode: [m] turn-to-turn")
 		if m.rtStreamMode {
 			modeLine = MutedStyle.Render("  Mode: [m] streaming (live)")
 		}
@@ -1160,7 +1185,7 @@ func (m ViewerModel) buildRTLines(w int) []string {
 	if m.rtStreamMode {
 		lines = append(lines, MutedStyle.Render("  Mode: [m] streaming (live)"))
 	} else {
-		lines = append(lines, MutedStyle.Render("  Mode: [m] turn-by-turn"))
+		lines = append(lines, MutedStyle.Render("  Mode: [m] turn-to-turn"))
 	}
 	lines = append(lines, "")
 	lines = append(lines, buildTurnBlock(t, w, m.spinnerTick)...)
@@ -1212,13 +1237,45 @@ func (m ViewerModel) buildDebugLines(w int) []string {
 	if len(m.debugLog) == 0 {
 		return []string{"", MutedStyle.Render("  No debug messages yet."), ""}
 	}
-	// Newest first: iterate in reverse
-	for i := len(m.debugLog) - 1; i >= 0; i-- {
+	for i := 0; i < len(m.debugLog); i++ {
 		for _, wrapped := range wordWrapDisplay(m.debugLog[i], textMaxW) {
 			lines = append(lines, DimStyle.Render("  "+wrapped))
 		}
 	}
 	return lines
+}
+
+func visibleLinesFromBottom(allLines []string, height, offset int) ([]string, int, int, int) {
+	if height <= 0 {
+		return nil, 0, 0, 0
+	}
+	maxOffset := len(allLines) - height
+	if maxOffset < 0 {
+		maxOffset = 0
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	if offset > maxOffset {
+		offset = maxOffset
+	}
+	end := len(allLines) - offset
+	if end < 0 {
+		end = 0
+	}
+	start := end - height
+	if start < 0 {
+		start = 0
+	}
+	visible := append([]string(nil), allLines[start:end]...)
+	if pad := height - len(visible); pad > 0 {
+		padded := make([]string, 0, height)
+		for i := 0; i < pad; i++ {
+			padded = append(padded, "")
+		}
+		visible = append(padded, visible...)
+	}
+	return visible, offset, start, end
 }
 
 // ── Turn block builders ────────────────────────────────────────────────────────
@@ -1478,7 +1535,7 @@ func renderMarkdownLines(text string, maxW int, baseStyle lipgloss.Style) []stri
 	return lines
 }
 
-// stripInlineMarkdown removes inline markdown markers (**, *, ``) from text.
+// stripInlineMarkdown removes inline markdown markers (**, *, “) from text.
 func stripInlineMarkdown(s string) string {
 	// Remove **bold** and *italic* markers, keep content
 	var out strings.Builder
@@ -1541,7 +1598,7 @@ func renderPanel(title, content string, width int) string {
 	// Content lines
 	available := inner - 2 // 1 space padding each side
 	var body strings.Builder
-	for _, line := range strings.Split(strings.TrimRight(content, "\n"), "\n") {
+	for _, line := range strings.Split(content, "\n") {
 		lineW := lipgloss.Width(line)
 		pad := available - lineW
 		if pad < 0 {
