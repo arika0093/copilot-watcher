@@ -141,27 +141,25 @@ func (m SelectorModel) View() string {
 		body.WriteString(ErrorStyle.Render(fmt.Sprintf("  ✗ Error: %v", m.err)))
 		body.WriteString("\n")
 	} else if len(m.sessions) == 0 {
-		body.WriteString(WarnStyle.Render("  No active Copilot CLI sessions found."))
+		body.WriteString(WarnStyle.Render("  No Copilot CLI sessions found."))
 		body.WriteString("\n")
-		body.WriteString(MutedStyle.Render("  Make sure a Copilot CLI session is running, then press [r] to refresh."))
+		body.WriteString(MutedStyle.Render("  Sessions appear after the first message is sent in Copilot CLI."))
 		body.WriteString("\n")
-		body.WriteString(MutedStyle.Render("  ℹ Sessions are only visible after the first message is sent in Copilot CLI."))
-		body.WriteString("\n")
-		body.WriteString(MutedStyle.Render("    If Copilot CLI is open but no conversation has started, nothing will appear here."))
+		body.WriteString(MutedStyle.Render("  Press [r] to refresh."))
 		body.WriteString("\n")
 	} else {
 		// Column headers
 		hdr := fmt.Sprintf("  %-8s  %-36s  %-8s  %-10s  %s",
-			"SESSION", "CWD", "PID", "AGE", "SUMMARY")
+			"SESSION", "CWD", "PID", "AGE", "STATUS")
 		body.WriteString(DimStyle.Render(hdr))
 		body.WriteString("\n")
 		body.WriteString(DimStyle.Render("  " + strings.Repeat("─", inner-2)))
 		body.WriteString("\n")
 
 		for i, s := range m.sessions {
-			cursor := "  "
+			cursorStr := "  "
 			if i == m.cursor {
-				cursor = WarnStyle.Render("❯ ")
+				cursorStr = WarnStyle.Render("❯ ")
 			}
 			sid := s.SessionID
 			if len(sid) > 8 {
@@ -172,32 +170,39 @@ func (m SelectorModel) View() string {
 				cwd = "…" + cwd[len(cwd)-35:]
 			}
 			age := fmtAge(s.UpdatedAt)
-			sum := s.Summary
-			if len(sum) > 20 {
-				sum = sum[:17] + "…"
+			pidStr := "—"
+			if s.PID > 0 {
+				pidStr = fmt.Sprintf("%d", s.PID)
+			}
+			var statusStr string
+			if s.Active {
+				statusStr = ActiveStyle.Render("● active")
+			} else {
+				statusStr = MutedStyle.Render("○ inactive")
 			}
 
-			line := fmt.Sprintf("%s%-8s  %-36s  %-8s  %-10s  %s",
-				cursor,
-				TitleStyle.Render(sid),
-				TextStyle.Render(cwd),
-				PIDStyle.Render(fmt.Sprintf("%d", s.PID)),
-				MutedStyle.Render(age),
-				MutedStyle.Render(sum),
-			)
 			if i == m.cursor {
-				line = SelectedStyle.Render(fmt.Sprintf(
-					" %-8s  %-36s  %-8s  %-10s  %-20s",
-					sid, s.Cwd, fmt.Sprintf("%d", s.PID), age, sum,
-				))
-				line = " ❯ " + line
+				line := " ❯ " + SelectedStyle.Render(fmt.Sprintf(
+					" %-8s  %-36s  %-8s  %-10s  ",
+					sid, s.Cwd, pidStr, age,
+				)) + statusStr
+				body.WriteString(line)
+			} else {
+				line := fmt.Sprintf("%s%-8s  %-36s  %-8s  %-10s  %s",
+					cursorStr,
+					TitleStyle.Render(sid),
+					TextStyle.Render(cwd),
+					PIDStyle.Render(pidStr),
+					MutedStyle.Render(age),
+					statusStr,
+				)
+				body.WriteString(line)
 			}
-			body.WriteString(line)
 			body.WriteString("\n")
 		}
 	}
 
-	panel := renderPanel(" Active Sessions ", body.String(), w)
+	panel := renderPanel(" Sessions ", body.String(), w)
 	sb.WriteString(panel)
 	sb.WriteString("\n")
 

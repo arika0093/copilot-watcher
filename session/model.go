@@ -45,10 +45,11 @@ type WorkspaceConfig struct {
 	UpdatedAt time.Time `json:"updated_at" yaml:"updated_at"`
 }
 
-// SessionInfo represents a detected active Copilot CLI session
+// SessionInfo represents a detected Copilot CLI session (active or inactive)
 type SessionInfo struct {
 	SessionID  string
-	PID        int
+	Active     bool // true if the session process is currently running
+	PID        int  // non-zero only when Active==true
 	Cwd        string
 	Summary    string
 	CreatedAt  time.Time

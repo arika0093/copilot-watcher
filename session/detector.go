@@ -17,8 +17,9 @@ import (
 
 const sessionStateDir = ".copilot/session-state"
 
-// Detect scans ~/.copilot/session-state for active Copilot CLI sessions.
-// A session is considered active if its inuse.<pid>.lock file exists and the PID is alive.
+// Detect scans ~/.copilot/session-state for all Copilot CLI sessions.
+// Sessions with a live process are marked Active=true; others are included too
+// so the user can browse history even when Copilot CLI is not running.
 func Detect() ([]SessionInfo, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -39,7 +40,6 @@ func Detect() ([]SessionInfo, error) {
 		if !entry.IsDir() {
 			continue
 		}
-		// Skip copilot-watcher's own internal translation sessions
 		if strings.HasPrefix(entry.Name(), "copilot-watcher-") {
 			continue
 		}
@@ -51,58 +51,56 @@ func Detect() ([]SessionInfo, error) {
 		sessions = append(sessions, *info)
 	}
 
-	// Sort by most recently updated first
+	// Sort: active first, then by most recently updated
 	sort.Slice(sessions, func(i, j int) bool {
+		if sessions[i].Active != sessions[j].Active {
+			return sessions[i].Active
+		}
 		return sessions[i].UpdatedAt.After(sessions[j].UpdatedAt)
 	})
 	return sessions, nil
 }
 
 func parseSession(sessionDir, sessionID string) (*SessionInfo, error) {
-	// Find inuse.<pid>.lock file
-	lockFiles, err := filepath.Glob(filepath.Join(sessionDir, "inuse.*.lock"))
-	if err != nil || len(lockFiles) == 0 {
-		return nil, nil // no active lock = inactive session
-	}
-
-	// Parse PID from first lock file
-	lockBase := filepath.Base(lockFiles[0])
-	parts := strings.Split(lockBase, ".")
-	if len(parts) < 3 {
-		return nil, nil
-	}
-	pid, err := strconv.Atoi(parts[1])
-	if err != nil {
-		return nil, nil
-	}
-
-	// Verify PID is alive
-	if !isPIDAlive(pid) {
-		return nil, nil
-	}
-
-	// Read workspace.yaml
-	wsPath := filepath.Join(sessionDir, "workspace.yaml")
-	ws, err := readWorkspaceConfig(wsPath)
-	if err != nil {
-		// Use defaults if workspace.yaml is unreadable
-		ws = &WorkspaceConfig{ID: sessionID, Cwd: "unknown"}
-	}
-
+	// Must have events.jsonl to be useful
 	eventsPath := filepath.Join(sessionDir, "events.jsonl")
 	if _, err := os.Stat(eventsPath); err != nil {
 		return nil, nil
 	}
 
-	return &SessionInfo{
+	ws, err := readWorkspaceConfig(filepath.Join(sessionDir, "workspace.yaml"))
+	if err != nil {
+		ws = &WorkspaceConfig{ID: sessionID, Cwd: "unknown"}
+	}
+
+	info := &SessionInfo{
 		SessionID:  sessionID,
-		PID:        pid,
 		Cwd:        ws.Cwd,
 		Summary:    ws.Summary,
 		CreatedAt:  ws.CreatedAt,
 		UpdatedAt:  ws.UpdatedAt,
 		EventsPath: eventsPath,
-	}, nil
+	}
+
+	// Check whether a live process holds a lock on this session
+	lockFiles, _ := filepath.Glob(filepath.Join(sessionDir, "inuse.*.lock"))
+	for _, lf := range lockFiles {
+		parts := strings.Split(filepath.Base(lf), ".")
+		if len(parts) < 3 {
+			continue
+		}
+		pid, err := strconv.Atoi(parts[1])
+		if err != nil {
+			continue
+		}
+		if isPIDAlive(pid) {
+			info.Active = true
+			info.PID = pid
+			break
+		}
+	}
+
+	return info, nil
 }
 
 func readWorkspaceConfig(path string) (*WorkspaceConfig, error) {
@@ -230,10 +228,10 @@ func LoadHistory(eventsPath string) ([]Turn, error) {
 			d, err := ParseAssistantMessage(evt)
 			if err == nil {
 				if d.ReasoningText != "" {
-					currentReasoning = d.ReasoningText
+					currentReasoning += d.ReasoningText // accumulate (multiple msgs per turn)
 				}
 				if d.Content != "" {
-					currentContent = d.Content
+					currentContent += d.Content
 				}
 			}
 		case "assistant.turn_end":

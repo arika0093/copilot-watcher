@@ -393,7 +393,7 @@ func (m *ViewerModel) startHSAtCursor() tea.Cmd {
 	gen := m.hsGeneration
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	m.hsCancel = cancel
-	ch, err := m.trans.TranslateTurn(ctx, t.reasoning)
+	ch, err := m.trans.SummarizeRequest(ctx, t.userMsg, t.reasoning, t.response)
 	if err != nil {
 		t.translation.WriteString(fmt.Sprintf("Translation error: %v", err))
 		t.done = true
@@ -568,15 +568,10 @@ func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
 		}
 		m.debugLog = append(m.debugLog, dbgf("HISTORY loaded %d turns from events.jsonl", n))
 		if msg.Err == nil && len(msg.Turns) > 0 {
-			// Populate both Requests tab (hsTurns) and Reasoning tab (rtTurns) from history.
-			// Only set rtTurns if the watcher hasn't already populated it with live turns.
+			// Populate Requests tab (hsTurns) from history.
+			// RT tab (rtTurns) is only populated from live watcher events.
 			m.hsTurns = nil
 			m.hsQ = nil
-			populateRT := len(m.rtTurns) == 0
-			if populateRT {
-				m.rtTurns = nil
-				m.rtQ = nil
-			}
 			for i, t := range msg.Turns {
 				vt := &viewTurn{
 					turnNum:     i + 1,
@@ -590,41 +585,11 @@ func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
 					vt.done = true
 				}
 				m.hsTurns = append(m.hsTurns, vt)
-				if populateRT {
-					// Share translation state by reference isn't possible with value copy,
-					// so create a separate viewTurn for RT tab with same fields.
-					rtVt := &viewTurn{
-						turnNum:     i + 1,
-						userMsg:     t.UserMessage,
-						reasoning:   t.ReasoningText,
-						response:    t.Response,
-						isReasoning: t.ReasoningText != "",
-						timestamp:   t.Timestamp,
-					}
-					if !rtVt.isReasoning {
-						rtVt.done = true
-					}
-					m.rtTurns = append(m.rtTurns, rtVt)
-				}
-			}
-			if populateRT {
-				// Queue RT reasoning turns newest-first for translation
-				for i := len(m.rtTurns) - 1; i >= 0; i-- {
-					if m.rtTurns[i].isReasoning {
-						m.rtQ = append(m.rtQ, i)
-					}
-				}
 			}
 		}
-		cmds := []tea.Cmd{
-			func() tea.Msg {
-				return InitStepMsg{Step: fmt.Sprintf("Session has %d history turns (tabs [3]/[4] to view)", n), OK: true}
-			},
+		return m, func() tea.Msg {
+			return InitStepMsg{Step: fmt.Sprintf("Session has %d history turns (tab [3] to view)", n), OK: true}
 		}
-		if m.trans != nil && len(m.rtTurns) > 0 {
-			cmds = append(cmds, m.startNextRT())
-		}
-		return m, tea.Batch(cmds...)
 
 	case ReasoningDetectedMsg:
 		vt := &viewTurn{

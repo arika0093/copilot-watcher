@@ -207,6 +207,12 @@ func (t *Translator) Translate(ctx context.Context, reasoningText string) (<-cha
 func (t *Translator) TranslateTurn(ctx context.Context, reasoningText string) (<-chan string, error) {
 	return t.stream(ctx, t.histSession, HistSessionID, TranslateUserPrompt(reasoningText, t.outputLang, t.outputFormat))
 }
+// SummarizeRequest streams a summary of a single request turn (user message +
+// AI reasoning + AI response) using the isolated history session.
+func (t *Translator) SummarizeRequest(ctx context.Context, userMsg, reasoning, response string) (<-chan string, error) {
+	return t.stream(ctx, t.histSession, HistSessionID, RequestSummaryUserPrompt(userMsg, reasoning, response, t.outputLang, t.outputFormat))
+}
+
 func (t *Translator) SummarizeSession(ctx context.Context, label, reasoningText string) (<-chan string, error) {
 	return t.stream(ctx, t.histSession, HistSessionID, SessionSummaryUserPrompt(label, reasoningText, t.outputLang, t.outputFormat))
 }

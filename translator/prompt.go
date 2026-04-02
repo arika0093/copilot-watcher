@@ -76,7 +76,29 @@ func SessionSummaryUserPrompt(label, reasoningText, lang, format string) string 
 	)
 }
 
-// AllSessionsUserPrompt builds the user message for an all-sessions unified summary.
+// RequestSummaryUserPrompt builds the summary prompt for a single request turn.
+// Combines user question, AI reasoning, and AI response for a complete picture.
+func RequestSummaryUserPrompt(userMsg, reasoning, response, lang, format string) string {
+	var sb strings.Builder
+	if userMsg != "" {
+		sb.WriteString("User request:\n")
+		sb.WriteString(StripXMLTags(userMsg))
+		sb.WriteString("\n\n")
+	}
+	if reasoning != "" {
+		sb.WriteString("AI internal reasoning:\n")
+		sb.WriteString(StripXMLTags(reasoning))
+		sb.WriteString("\n\n")
+	}
+	if response != "" {
+		sb.WriteString("AI response to user:\n")
+		sb.WriteString(StripXMLTags(response))
+	}
+	return fmt.Sprintf(
+		"Language: %s\nFormat: %s\nTask: Summarize this Copilot CLI request. Focus on: (1) what problem or goal the user presented, (2) what the AI thought and decided, (3) what outcome or response was given. Be concise.\n\n%s",
+		lang, FormatInstruction(format), strings.TrimSpace(sb.String()),
+	)
+}
 func AllSessionsUserPrompt(reasoningText, lang, format string) string {
 	return fmt.Sprintf(
 		"Language: %s\nFormat: %s\nTask: Create ONE unified summary across ALL sessions below. For each notable request, describe: (1) the problem or goal, and (2) what was done. Do NOT split by session — integrate everything into a single cohesive overview.\n\n%s",
