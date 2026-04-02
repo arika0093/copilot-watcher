@@ -40,9 +40,9 @@ type fmtOption struct {
 }
 
 var formats = []fmtOption{
-	{"bullets", "Bullet summary", "- key points (default)"},
+	{"conversational", "Conversational", "casual summary (default)"},
+	{"bullets", "Bullet summary", "- key points"},
 	{"translate-only", "Translation only", "faithful, no summarizing"},
-	{"conversational", "Conversational", "casual style"},
 	{"", "Custom…", "type your own instruction"},
 }
 
@@ -354,7 +354,7 @@ func fmtLabel(code string) string {
 		}
 	}
 	if code == "" {
-		return "Bullet summary"
+		return "Conversational"
 	}
 	return trimStr(code, 20)
 }

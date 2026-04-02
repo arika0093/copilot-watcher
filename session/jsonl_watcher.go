@@ -21,6 +21,7 @@ type ReasoningMsg struct {
 	SessionID     string
 	UserMessage   string
 	ReasoningText string
+	ContentText   string // non-reasoning AI response content
 	Timestamp     time.Time
 }
 
@@ -99,6 +100,7 @@ func (w *Watcher) readLoop(f *os.File, fw *fsnotify.Watcher) {
 	var partial []byte // incomplete line buffered across reads
 	var pendingUser string
 	var pendingReasoning string
+	var pendingContent string
 	var pendingTS time.Time
 	lineCount := 0
 
@@ -137,7 +139,7 @@ func (w *Watcher) readLoop(f *os.File, fw *fsnotify.Watcher) {
 			}
 			linesRead++
 			lineCount++
-			w.processLine(chunk, &pendingUser, &pendingReasoning, &pendingTS)
+			w.processLine(chunk, &pendingUser, &pendingReasoning, &pendingContent, &pendingTS)
 		}
 		if linesRead > 0 {
 			w.sendDbg(fmt.Sprintf("events.jsonl flushed: +%d line(s) (total %d)", linesRead, lineCount))
@@ -170,7 +172,7 @@ func (w *Watcher) readLoop(f *os.File, fw *fsnotify.Watcher) {
 	}
 }
 
-func (w *Watcher) processLine(line []byte, pendingUser *string, pendingReasoning *string, pendingTS *time.Time) {
+func (w *Watcher) processLine(line []byte, pendingUser *string, pendingReasoning *string, pendingContent *string, pendingTS *time.Time) {
 	var evt SessionEvent
 	if err := json.Unmarshal(line, &evt); err != nil {
 		return
@@ -181,6 +183,7 @@ func (w *Watcher) processLine(line []byte, pendingUser *string, pendingReasoning
 		if err == nil {
 			*pendingUser = d.Content
 			*pendingReasoning = ""
+			*pendingContent = ""
 			*pendingTS = evt.Timestamp
 			w.sendDbg(fmt.Sprintf("user.message: %d chars", len(d.Content)))
 		}
@@ -189,18 +192,17 @@ func (w *Watcher) processLine(line []byte, pendingUser *string, pendingReasoning
 		if err != nil {
 			return
 		}
-		// Accumulate reasoning text (prefer reasoningText, fall back to content)
 		if d.ReasoningText != "" {
 			*pendingReasoning += d.ReasoningText
 			w.sendDbg(fmt.Sprintf("assistant.message (reasoningText): %d chars accumulated", len(*pendingReasoning)))
-		} else if d.Content != "" {
-			*pendingReasoning += d.Content
-			w.sendDbg(fmt.Sprintf("assistant.message (content): %d chars accumulated", len(*pendingReasoning)))
+		}
+		if d.Content != "" {
+			*pendingContent += d.Content
+			w.sendDbg(fmt.Sprintf("assistant.message (content): %d chars accumulated", len(*pendingContent)))
 		}
 	case "assistant.turn_end":
 		w.sendDbg("assistant.turn_end received")
-		// Emit the full accumulated turn only now that it is complete
-		if *pendingUser != "" && *pendingReasoning != "" {
+		if *pendingUser != "" && (*pendingReasoning != "" || *pendingContent != "") {
 			ts := *pendingTS
 			if ts.IsZero() {
 				ts = time.Now()
@@ -210,12 +212,14 @@ func (w *Watcher) processLine(line []byte, pendingUser *string, pendingReasoning
 				SessionID:     w.sessionID,
 				UserMessage:   *pendingUser,
 				ReasoningText: *pendingReasoning,
+				ContentText:   *pendingContent,
 				Timestamp:     ts,
 			}:
-				w.sendDbg(fmt.Sprintf("turn emitted (%d chars) → queuing translation", len(*pendingReasoning)))
+				w.sendDbg(fmt.Sprintf("turn emitted (reasoning=%d, content=%d chars)", len(*pendingReasoning), len(*pendingContent)))
 			default:
 			}
 			*pendingReasoning = ""
+			*pendingContent = ""
 		}
 	}
 }

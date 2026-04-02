@@ -51,9 +51,10 @@ var (
 	TextStyle    = lipgloss.NewStyle().Foreground(clrText)
 	PIDStyle     = lipgloss.NewStyle().Foreground(clrPID)
 	DimStyle     = lipgloss.NewStyle().Foreground(clrDim)
-	UserMsgStyle = lipgloss.NewStyle().Foreground(clrUserMsg).Bold(true)
-	TransStyle   = lipgloss.NewStyle().Foreground(clrTranslated)
-	ReasonStyle  = lipgloss.NewStyle().Foreground(clrReasoning)
+	UserMsgStyle    = lipgloss.NewStyle().Foreground(clrUserMsg).Bold(true)
+	TransStyle      = lipgloss.NewStyle().Foreground(clrTranslated)      // content turns
+	ReasonTransStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#A8A8A8")) // reasoning translation (gray)
+	ReasonStyle     = lipgloss.NewStyle().Foreground(clrReasoning)
 
 	TabActiveStyle   = lipgloss.NewStyle().Foreground(clrActive).Bold(true)
 	TabInactiveStyle = lipgloss.NewStyle().Foreground(clrDim)

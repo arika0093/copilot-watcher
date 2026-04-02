@@ -12,7 +12,7 @@ type Config struct {
 }
 
 func DefaultConfig() Config {
-	return Config{Language: "Japanese", Format: "bullets"}
+	return Config{Language: "Japanese", Format: "conversational"}
 }
 
 func configPath() (string, error) {
@@ -48,7 +48,7 @@ func Load() (Config, error) {
 		c.Language = "Japanese"
 	}
 	if c.Format == "" {
-		c.Format = "bullets"
+		c.Format = "conversational"
 	}
 	return c, nil
 }

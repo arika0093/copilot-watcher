@@ -97,7 +97,9 @@ type viewTurn struct {
 	turnNum     int
 	label       string // for history tabs: session ID / "All Sessions"
 	userMsg     string
-	reasoning   string
+	reasoning   string // AI internal reasoning text
+	response    string // AI response content (non-reasoning)
+	isReasoning bool   // true when this turn has reasoning text
 	translation strings.Builder
 	errMsg      string // non-empty when the translation API returned an error
 	translating bool
@@ -118,6 +120,7 @@ type ViewerModel struct {
 
 	// Real-time tab (events.jsonl)
 	rtTurns  []*viewTurn
+	rtCursor int // 0 = newest, increments toward older
 	rtQ      []int
 	rtCh     <-chan string
 	rtCancel context.CancelFunc
@@ -131,6 +134,7 @@ type ViewerModel struct {
 
 	// History: Turns tab (per-request of the current session)
 	hsTurns      []*viewTurn
+	hsCursor     int  // 0 = newest, increments toward older
 	hsQ          []int // translation queue (indices), newest first
 	hsGeneration int   // incremented per new translation to discard stale msgs
 	hsCh         <-chan string
@@ -365,6 +369,41 @@ func (m *ViewerModel) startNextRT() tea.Cmd {
 	return nil
 }
 
+// startHSAtCursor translates only the currently visible Requests turn (on-demand).
+func (m *ViewerModel) startHSAtCursor() tea.Cmd {
+	if len(m.hsTurns) == 0 {
+		return nil
+	}
+	cursor := m.hsCursor
+	if cursor >= len(m.hsTurns) {
+		cursor = len(m.hsTurns) - 1
+	}
+	idx := len(m.hsTurns) - 1 - cursor
+	if idx < 0 {
+		idx = 0
+	}
+	t := m.hsTurns[idx]
+	if t.done || t.translating || t.reasoning == "" || !t.isReasoning {
+		return nil
+	}
+	if m.hsCancel != nil {
+		m.hsCancel()
+	}
+	m.hsGeneration++
+	gen := m.hsGeneration
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	m.hsCancel = cancel
+	ch, err := m.trans.TranslateTurn(ctx, t.reasoning)
+	if err != nil {
+		t.translation.WriteString(fmt.Sprintf("Translation error: %v", err))
+		t.done = true
+		return nil
+	}
+	t.translating = true
+	m.hsCh = ch
+	return tea.Batch(waitForHSChunk(idx, gen, ch), spinnerCmd())
+}
+
 // startNextHS translates the next queued turn in the History/Turns tab.
 // Uses the histSession (independent from the RT session) for per-turn translation.
 func (m *ViewerModel) startNextHS() tea.Cmd {
@@ -528,64 +567,109 @@ func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
 			n = 0
 		}
 		m.debugLog = append(m.debugLog, dbgf("HISTORY loaded %d turns from events.jsonl", n))
-		// Populate History/Turns tab with historical turns (newest first in queue)
 		if msg.Err == nil && len(msg.Turns) > 0 {
+			// Populate both Requests tab (hsTurns) and Reasoning tab (rtTurns) from history.
+			// Only set rtTurns if the watcher hasn't already populated it with live turns.
 			m.hsTurns = nil
 			m.hsQ = nil
+			populateRT := len(m.rtTurns) == 0
+			if populateRT {
+				m.rtTurns = nil
+				m.rtQ = nil
+			}
 			for i, t := range msg.Turns {
 				vt := &viewTurn{
-					turnNum:   i + 1,
-					userMsg:   t.UserMessage,
-					reasoning: t.ReasoningText,
-					timestamp: t.Timestamp,
+					turnNum:     i + 1,
+					userMsg:     t.UserMessage,
+					reasoning:   t.ReasoningText,
+					response:    t.Response,
+					isReasoning: t.ReasoningText != "",
+					timestamp:   t.Timestamp,
+				}
+				if !vt.isReasoning {
+					vt.done = true
 				}
 				m.hsTurns = append(m.hsTurns, vt)
+				if populateRT {
+					// Share translation state by reference isn't possible with value copy,
+					// so create a separate viewTurn for RT tab with same fields.
+					rtVt := &viewTurn{
+						turnNum:     i + 1,
+						userMsg:     t.UserMessage,
+						reasoning:   t.ReasoningText,
+						response:    t.Response,
+						isReasoning: t.ReasoningText != "",
+						timestamp:   t.Timestamp,
+					}
+					if !rtVt.isReasoning {
+						rtVt.done = true
+					}
+					m.rtTurns = append(m.rtTurns, rtVt)
+				}
 			}
-			// Queue newest first
-			for i := len(m.hsTurns) - 1; i >= 0; i-- {
-				if m.hsTurns[i].reasoning != "" {
-					m.hsQ = append(m.hsQ, i)
+			if populateRT {
+				// Queue RT reasoning turns newest-first for translation
+				for i := len(m.rtTurns) - 1; i >= 0; i-- {
+					if m.rtTurns[i].isReasoning {
+						m.rtQ = append(m.rtQ, i)
+					}
 				}
 			}
 		}
-		var cmds []tea.Cmd
-		cmds = append(cmds, func() tea.Msg {
-			return InitStepMsg{Step: fmt.Sprintf("Session has %d history turns (tabs [3]/[4] to view)", n), OK: true}
-		})
-		if m.trans != nil {
-			cmds = append(cmds, m.startNextHS())
+		cmds := []tea.Cmd{
+			func() tea.Msg {
+				return InitStepMsg{Step: fmt.Sprintf("Session has %d history turns (tabs [3]/[4] to view)", n), OK: true}
+			},
+		}
+		if m.trans != nil && len(m.rtTurns) > 0 {
+			cmds = append(cmds, m.startNextRT())
 		}
 		return m, tea.Batch(cmds...)
 
 	case ReasoningDetectedMsg:
 		vt := &viewTurn{
-			turnNum:   len(m.rtTurns) + 1,
-			userMsg:   msg.UserMessage,
-			reasoning: msg.ReasoningText,
-			timestamp: msg.Timestamp,
+			turnNum:     len(m.rtTurns) + 1,
+			userMsg:     msg.UserMessage,
+			reasoning:   msg.ReasoningText,
+			response:    msg.ContentText,
+			isReasoning: msg.ReasoningText != "",
+			timestamp:   msg.Timestamp,
 		}
 		m.rtTurns = append(m.rtTurns, vt)
 		idx := len(m.rtTurns) - 1
-		m.rtQ = append([]int{idx}, m.rtQ...) // live turn: priority
-		m.debugLog = append(m.debugLog, dbgf("RT turn #%d detected (%d chars), queuing translation", idx+1, len(msg.ReasoningText)))
+		if vt.isReasoning {
+			m.rtQ = append([]int{idx}, m.rtQ...) // live turn: priority
+		} else {
+			vt.done = true // content-only: no translation needed
+		}
+		m.debugLog = append(m.debugLog, dbgf("RT turn #%d detected (reasoning=%d content=%d chars)", idx+1, len(msg.ReasoningText), len(msg.ContentText)))
 
 		// Also add to History/Turns tab so all session turns are visible there
 		hsVt := &viewTurn{
-			turnNum:   len(m.hsTurns) + 1,
-			userMsg:   msg.UserMessage,
-			reasoning: msg.ReasoningText,
-			timestamp: msg.Timestamp,
+			turnNum:     len(m.hsTurns) + 1,
+			userMsg:     msg.UserMessage,
+			reasoning:   msg.ReasoningText,
+			response:    msg.ContentText,
+			isReasoning: msg.ReasoningText != "",
+			timestamp:   msg.Timestamp,
 		}
 		m.hsTurns = append(m.hsTurns, hsVt)
 		hsIdx := len(m.hsTurns) - 1
-		m.hsQ = append([]int{hsIdx}, m.hsQ...) // priority: newest first
+		if hsVt.isReasoning {
+			m.hsQ = append([]int{hsIdx}, m.hsQ...)
+		} else {
+			hsVt.done = true
+		}
 
 		var cmds []tea.Cmd
 		if m.watcher != nil {
 			cmds = append(cmds, waitForReasoning(m.watcher.Chan()))
 		}
 		cmds = append(cmds, m.startNextRT())
-		cmds = append(cmds, m.startNextHS())
+		// For HS tab: only translate if currently viewing this new turn
+		if m.activeTab == TabHistorySessions && m.hsCursor == 0 {
+			cmds = append(cmds, m.startHSAtCursor())
+		}
 		return m, tea.Batch(cmds...)
 
 	case RTChunkMsg:
@@ -668,24 +752,21 @@ func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
 		} else {
 			for i, t := range msg.Turns {
 				vt := &viewTurn{
-					turnNum:   i + 1,
-					userMsg:   t.UserMessage,
-					reasoning: t.ReasoningText,
-					timestamp: t.Timestamp,
+					turnNum:     i + 1,
+					userMsg:     t.UserMessage,
+					reasoning:   t.ReasoningText,
+					response:    t.Response,
+					isReasoning: t.ReasoningText != "",
+					timestamp:   t.Timestamp,
+				}
+				if !vt.isReasoning {
+					vt.done = true
 				}
 				m.hsTurns = append(m.hsTurns, vt)
 			}
-			// Queue newest first
-			for i := len(m.hsTurns) - 1; i >= 0; i-- {
-				if m.hsTurns[i].reasoning != "" {
-					m.hsQ = append(m.hsQ, i)
-				}
-			}
 			m.debugLog = append(m.debugLog, dbgf("HISTORY TURNS loaded %d turns", len(msg.Turns)))
 		}
-		if m.trans != nil {
-			return m, m.startNextHS()
-		}
+		// Translation starts on-demand when user views the Requests tab.
 		return m, nil
 
 	case HSChunkMsg:
@@ -801,17 +882,18 @@ func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
 		switch msg.String() {
 		case "esc", "b":
 			return m, func() tea.Msg { return BackToListMsg{} }
-		case "y":
-			return m, m.saveCurrentTabCmd()
 		case "1":
 			m.activeTab = TabRealtime
-			m.debugLog = append(m.debugLog, dbgf("TAB switched to Real-time"))
+			m.debugLog = append(m.debugLog, dbgf("TAB switched to Reasoning"))
 		case "2":
 			m.activeTab = TabLiveStream
 			m.debugLog = append(m.debugLog, dbgf("TAB switched to Live Stream"))
 		case "3":
 			m.activeTab = TabHistorySessions
-			m.debugLog = append(m.debugLog, dbgf("TAB switched to History: Turns"))
+			m.debugLog = append(m.debugLog, dbgf("TAB switched to Requests"))
+			if m.trans != nil {
+				return m, m.startHSAtCursor()
+			}
 		case "4":
 			// Always reload all-sessions summary when switching to this tab
 			m.activeTab = TabHistoryAll
@@ -833,6 +915,38 @@ func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
 			}
 		case "down", "j":
 			m.scroll[m.activeTab]++
+		case "left":
+			switch m.activeTab {
+			case TabRealtime:
+				if m.rtCursor < len(m.rtTurns)-1 {
+					m.rtCursor++
+					m.scroll[m.activeTab] = 0
+				}
+			case TabHistorySessions:
+				if m.hsCursor < len(m.hsTurns)-1 {
+					m.hsCursor++
+					m.scroll[m.activeTab] = 0
+					if m.trans != nil {
+						return m, m.startHSAtCursor()
+					}
+				}
+			}
+		case "right":
+			switch m.activeTab {
+			case TabRealtime:
+				if m.rtCursor > 0 {
+					m.rtCursor--
+					m.scroll[m.activeTab] = 0
+				}
+			case TabHistorySessions:
+				if m.hsCursor > 0 {
+					m.hsCursor--
+					m.scroll[m.activeTab] = 0
+					if m.trans != nil {
+						return m, m.startHSAtCursor()
+					}
+				}
+			}
 		case "G":
 			m.scroll[m.activeTab] = 999999
 		case "g":
@@ -948,7 +1062,7 @@ func (m ViewerModel) View() string {
 		scrollInfo = fmt.Sprintf("   [%d/%d lines]", offset+1, len(allLines))
 	}
 	help := HelpStyle.Render(fmt.Sprintf(
-		"  [esc/b] back   [1-5] tab   [↑↓/kj] scroll   [g/G] top/bottom   [y] save   [q] quit%s",
+		"  [esc/b] back   [1-5] tab   [↑↓/kj] scroll   [g/G] top/bottom   [q] quit%s",
 		scrollInfo,
 	))
 	sb.WriteString(help)
@@ -961,10 +1075,10 @@ func (m ViewerModel) renderTabBar(w int) string {
 		label string
 	}
 	tabs := []tabDef{
-		{TabRealtime, "[1] Real-time"},
+		{TabRealtime, "[1] Reasoning"},
 		{TabLiveStream, "[2] Live Stream"},
-		{TabHistorySessions, "[3] History: Turns"},
-		{TabHistoryAll, "[4] History: All"},
+		{TabHistorySessions, "[3] Requests"},
+		{TabHistoryAll, "[4] All"},
 		{TabDebug, "[5] Debug"},
 	}
 	var parts []string
@@ -992,7 +1106,7 @@ func (m ViewerModel) buildPanelTitle() string {
 	var title string
 	switch m.activeTab {
 	case TabRealtime:
-		title = " AI Thought Translator"
+		title = " Reasoning"
 		for _, t := range m.rtTurns {
 			if t.translating {
 				title += " " + WarnStyle.Render(SpinnerFrames[m.spinnerTick]+" translating")
@@ -1011,7 +1125,7 @@ func (m ViewerModel) buildPanelTitle() string {
 			title += " " + MutedStyle.Render(fmt.Sprintf(" [buffering %d bytes…]", m.tsBuffer.Len()))
 		}
 	case TabHistorySessions:
-		title = " History: Turns"
+		title = " Requests"
 		anyTranslating := false
 		for _, t := range m.hsTurns {
 			if t.translating {
@@ -1023,7 +1137,7 @@ func (m ViewerModel) buildPanelTitle() string {
 			title += " " + WarnStyle.Render(SpinnerFrames[m.spinnerTick]+" translating")
 		}
 	case TabHistoryAll:
-		title = " History: All Sessions"
+		title = " All Sessions"
 		if m.haEntry != nil && m.haEntry.translating {
 			title += " " + WarnStyle.Render(SpinnerFrames[m.spinnerTick]+" summarizing")
 		}
@@ -1055,18 +1169,24 @@ func (m ViewerModel) buildRTLines(w int) []string {
 		return []string{
 			"",
 			WarnStyle.Render("  Waiting for Copilot CLI to produce reasoning output..."),
-			MutedStyle.Render("  (New turns will appear here as Copilot processes requests)"),
+			MutedStyle.Render("  (New reasoning steps will appear here as Copilot processes requests)"),
 			"",
 		}
 	}
-	var lines []string
-	// Newest first
-	for i := len(m.rtTurns) - 1; i >= 0; i-- {
-		if i < len(m.rtTurns)-1 {
-			lines = append(lines, MutedStyle.Render("  "+strings.Repeat("─", max(0, w-8))))
-		}
-		lines = append(lines, buildTurnBlock(m.rtTurns[i], w, m.spinnerTick)...)
+	cursor := m.rtCursor
+	if cursor >= len(m.rtTurns) {
+		cursor = len(m.rtTurns) - 1
 	}
+	idx := len(m.rtTurns) - 1 - cursor
+	if idx < 0 {
+		idx = 0
+	}
+	t := m.rtTurns[idx]
+	total := len(m.rtTurns)
+
+	lines := buildNavBar(cursor, total, "Reasoning", t.timestamp, w)
+	lines = append(lines, "")
+	lines = append(lines, buildTurnBlock(t, w, m.spinnerTick)...)
 	return lines
 }
 
@@ -1078,31 +1198,51 @@ func (m ViewerModel) buildTSLines(w int) []string {
 		}
 		lines := []string{
 			"",
-			WarnStyle.Render("  Live Stream: PTY master not accessible in this environment."),
+			WarnStyle.Render("  Live Stream: no active terminal capture detected."),
+			"",
+			MutedStyle.Render("  Start capturing in a separate terminal window, then copilot-watcher"),
+			MutedStyle.Render("  will pick it up automatically within a few seconds."),
 			"",
 		}
 		// tmux option (shown first, if available)
 		if m.hasTmux {
 			lines = append(lines,
-				ActiveStyle.Render("  Option 1 — tmux (recommended, non-destructive):"),
+				ActiveStyle.Render("  Option 1 — tmux (recommended if copilot is already running in tmux):"),
 				TextStyle.Render("    tmux pipe-pane -o 'cat >> "+teePathDisplay+"'"),
-				MutedStyle.Render("    (Run in any tmux window where copilot is running)"),
+				MutedStyle.Render("    Run this in any tmux window. It pipes the active pane's output to the file."),
+				MutedStyle.Render("    To stop: tmux pipe-pane  (no arguments)"),
 				"",
-				MutedStyle.Render("  Option 2 — script (records in a new shell session):"),
+				ActiveStyle.Render("  Option 2 — script (start copilot inside a recording shell):"),
 			)
 		} else {
 			lines = append(lines,
-				MutedStyle.Render("  Option 1 — script (records in a new shell session):"),
+				ActiveStyle.Render("  script — start copilot inside a recording shell:"),
 			)
 		}
 		lines = append(lines,
-			MutedStyle.Render("    # Linux:"),
-			TextStyle.Render("    script -a -q -f "+teePathDisplay),
-			MutedStyle.Render("    # macOS:"),
-			TextStyle.Render("    script -a -q -F "+teePathDisplay),
-			MutedStyle.Render("    # Run copilot in the new shell that opens. Exit with Ctrl+D."),
-			"",
-			WarnStyle.Render("  ⚠ Do NOT use 'copilot | tee ...' — it disables copilot's TUI interaction."),
+			MutedStyle.Render("    Step 1: Open a new terminal (separate from this one) and run:"),
+		)
+		if m.hasTmux {
+			lines = append(lines,
+				MutedStyle.Render("    # Linux:"),
+				TextStyle.Render("      script -a -q -f "+teePathDisplay),
+				MutedStyle.Render("    # macOS:"),
+				TextStyle.Render("      script -a -q -F "+teePathDisplay),
+			)
+		} else {
+			// Detect OS hint via GOOS is not available here; show both
+			lines = append(lines,
+				MutedStyle.Render("    # Linux:"),
+				TextStyle.Render("      script -a -q -f "+teePathDisplay),
+				MutedStyle.Render("    # macOS:"),
+				TextStyle.Render("      script -a -q -F "+teePathDisplay),
+			)
+		}
+		lines = append(lines,
+			MutedStyle.Render("    Step 2: A new shell opens — run copilot inside it:"),
+			TextStyle.Render("      gh copilot suggest \"...\""),
+			MutedStyle.Render("    Step 3: When done with copilot, stop the recording:"),
+			TextStyle.Render("      exit"),
 			"",
 			MutedStyle.Render(fmt.Sprintf("  Waiting for %s to appear...", teePathDisplay)),
 			"",
@@ -1129,16 +1269,22 @@ func (m ViewerModel) buildTSLines(w int) []string {
 
 func (m ViewerModel) buildHSLines(w int) []string {
 	if len(m.hsTurns) == 0 {
-		return []string{"", WarnStyle.Render("  No turns found for this session yet."), ""}
+		return []string{"", WarnStyle.Render("  No requests found for this session yet."), ""}
 	}
-	var lines []string
-	// Newest first
-	for i := len(m.hsTurns) - 1; i >= 0; i-- {
-		if i < len(m.hsTurns)-1 {
-			lines = append(lines, MutedStyle.Render("  "+strings.Repeat("─", max(0, w-8))))
-		}
-		lines = append(lines, buildTurnBlock(m.hsTurns[i], w, m.spinnerTick)...)
+	cursor := m.hsCursor
+	if cursor >= len(m.hsTurns) {
+		cursor = len(m.hsTurns) - 1
 	}
+	idx := len(m.hsTurns) - 1 - cursor
+	if idx < 0 {
+		idx = 0
+	}
+	t := m.hsTurns[idx]
+	total := len(m.hsTurns)
+
+	lines := buildNavBar(cursor, total, "Request", t.timestamp, w)
+	lines = append(lines, "")
+	lines = append(lines, buildTurnBlock(t, w, m.spinnerTick)...)
 	return lines
 }
 
@@ -1169,88 +1315,91 @@ func (m ViewerModel) buildDebugLines(w int) []string {
 
 // ── Turn block builders ────────────────────────────────────────────────────────
 
-// buildTurnBlock builds lines for a real-time turn (with turn number and user message).
+// buildNavBar builds the navigation indicator line for single-turn views.
+// The timestamp ts is shown right-aligned if non-zero.
+func buildNavBar(cursor, total int, kind string, ts time.Time, w int) []string {
+	leftStr := DimStyle.Render(fmt.Sprintf("  %s %d / %d", kind, cursor+1, total))
+	var navParts []string
+	if cursor < total-1 {
+		navParts = append(navParts, MutedStyle.Render("[←] older"))
+	}
+	if cursor > 0 {
+		navParts = append(navParts, ActiveStyle.Render("[→] newer"))
+	}
+	navStr := ""
+	if len(navParts) > 0 {
+		navStr = "   " + strings.Join(navParts, "   ")
+	}
+	tsStr := timeAgo(ts)
+	if tsStr != "" {
+		tsRendered := MutedStyle.Render(tsStr)
+		leftWidth := lipgloss.Width(leftStr) + lipgloss.Width(navStr)
+		tsWidth := lipgloss.Width(tsRendered)
+		pad := w - leftWidth - tsWidth - 2
+		if pad > 1 {
+			return []string{leftStr + navStr + strings.Repeat(" ", pad) + tsRendered}
+		}
+		return []string{leftStr + navStr + "   " + tsRendered}
+	}
+	return []string{leftStr + navStr}
+}
+
+// timeAgo formats a time as a human-readable "X ago" string.
+func timeAgo(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	d := time.Since(t)
+	switch {
+	case d < time.Minute:
+		return fmt.Sprintf("%ds ago", int(d.Seconds()))
+	case d < time.Hour:
+		return fmt.Sprintf("%dm ago", int(d.Minutes()))
+	default:
+		return fmt.Sprintf("%dh ago", int(d.Hours()))
+	}
+}
+
+// buildTurnBlock builds lines for one turn. Reasoning turns get a full
+// translated block (gray); content-only turns show a compact response line.
 func buildTurnBlock(t *viewTurn, w int, spinTick int) []string {
-	var lines []string
-	// text max width = w - 2(borders) - 2(padding) - 2("  " prefix) = w-6
 	textMaxW := w - 6
 	if textMaxW < 20 {
 		textMaxW = 20
 	}
 
-	// Header line
-	age := ""
-	if !t.timestamp.IsZero() {
-		age = MutedStyle.Render("  " + fmtAge(t.timestamp))
-	}
-	lines = append(lines, ReasonStyle.Render(fmt.Sprintf("  Turn #%d", t.turnNum))+age)
+	var lines []string
 
-	// User message (compact, one line, truncated by rune)
+	// User message (compact, one line)
 	if t.userMsg != "" {
-		um := t.userMsg
-		// truncate to textMaxW display cols
-		if lipgloss.Width(um) > textMaxW-6 {
-			runes := []rune(um)
-			maxR := textMaxW - 9 // "  Q: \"...\"" overhead
-			if maxR < 5 {
-				maxR = 5
-			}
-			truncW := 0
-			end := 0
-			for end < len(runes) {
-				rw := lipgloss.Width(string(runes[end]))
-				if truncW+rw > maxR {
-					break
-				}
-				truncW += rw
-				end++
-			}
-			um = string(runes[:end]) + "…"
-		}
+		um := truncateDisplay(t.userMsg, textMaxW-9)
 		lines = append(lines, MutedStyle.Render("  Q: ")+UserMsgStyle.Render(`"`+um+`"`))
 	}
 
-	lines = append(lines, "")
-	lines = append(lines, buildTranslationLines(t, textMaxW, spinTick)...)
+	if t.timestamp.IsZero() {
+		lines = append(lines, "")
+	} else {
+		lines = append(lines, MutedStyle.Render("  "+fmtAge(t.timestamp)))
+	}
+
+	if t.isReasoning {
+		// Reasoning turn: full translated block in gray
+		lines = append(lines, buildReasoningLines(t, textMaxW, spinTick)...)
+	} else {
+		// Content-only turn: compact response display
+		lines = append(lines, buildResponseLines(t, textMaxW)...)
+	}
 	lines = append(lines, "")
 	return lines
 }
 
-// buildHistoryBlock builds lines for a history entry (session or all-sessions).
-func buildHistoryBlock(t *viewTurn, w int, spinTick int) []string {
+// buildReasoningLines renders the translated reasoning text (gray, markdown-aware).
+func buildReasoningLines(t *viewTurn, textMaxW int, spinTick int) []string {
 	var lines []string
-	textMaxW := w - 6
-	if textMaxW < 20 {
-		textMaxW = 20
-	}
-
-	// Header
-	age := ""
-	if !t.timestamp.IsZero() {
-		age = MutedStyle.Render("  " + fmtAge(t.timestamp))
-	}
-	label := t.label
-	if label == "" {
-		label = fmt.Sprintf("Session #%d", t.turnNum)
-	}
-	lines = append(lines, ReasonStyle.Render("  "+label)+age)
-	lines = append(lines, "")
-	lines = append(lines, buildTranslationLines(t, textMaxW, spinTick)...)
-	lines = append(lines, "")
-	return lines
-}
-
-// buildTranslationLines renders the translation content (or status) for a turn.
-func buildTranslationLines(t *viewTurn, textMaxW int, spinTick int) []string {
-	var lines []string
-
-	// Show API error state prominently.
 	if t.errMsg != "" {
 		lines = append(lines, ErrorStyle.Render("  ✗ API Error: "+t.errMsg))
-		lines = append(lines, MutedStyle.Render("  (The Copilot API returned an error for this turn.)"))
 		return lines
 	}
-
 	trans := t.translationStr()
 	if trans == "" {
 		if t.translating {
@@ -1261,26 +1410,203 @@ func buildTranslationLines(t *viewTurn, textMaxW int, spinTick int) []string {
 		}
 		return lines
 	}
+	lines = append(lines, renderMarkdownLines(trans, textMaxW, ReasonTransStyle)...)
+	if t.translating {
+		lines = append(lines, fmt.Sprintf("  %s", WarnStyle.Render(SpinnerFrames[spinTick])))
+	}
+	return lines
+}
 
-	for _, line := range strings.Split(trans, "\n") {
-		line = strings.TrimRight(line, " \t")
+// buildResponseLines renders a compact view of the AI response content (normal color).
+func buildResponseLines(t *viewTurn, textMaxW int) []string {
+	if t.response == "" {
+		return []string{MutedStyle.Render("  (no response content)")}
+	}
+	// Show first non-empty line, truncated
+	for _, line := range strings.SplitN(t.response, "\n", 10) {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		line = truncateDisplay(line, textMaxW-4)
+		return []string{TextStyle.Render("  ↩ " + line)}
+	}
+	return []string{MutedStyle.Render("  (no response content)")}
+}
+
+// buildHistoryBlock builds lines for a history entry (All Sessions tab).
+func buildHistoryBlock(t *viewTurn, w int, spinTick int) []string {
+	var lines []string
+	textMaxW := w - 6
+	if textMaxW < 20 {
+		textMaxW = 20
+	}
+	age := ""
+	if !t.timestamp.IsZero() {
+		age = MutedStyle.Render("  " + fmtAge(t.timestamp))
+	}
+	label := t.label
+	if label == "" {
+		label = fmt.Sprintf("Session #%d", t.turnNum)
+	}
+	lines = append(lines, ReasonStyle.Render("  "+label)+age)
+	lines = append(lines, "")
+	trans := t.translationStr()
+	if t.errMsg != "" {
+		lines = append(lines, ErrorStyle.Render("  ✗ API Error: "+t.errMsg))
+	} else if trans == "" {
+		if t.translating {
+			spin := WarnStyle.Render(SpinnerFrames[spinTick])
+			lines = append(lines, fmt.Sprintf("  %s  %s", spin, WarnStyle.Render("Summarizing...")))
+		} else if !t.done {
+			lines = append(lines, MutedStyle.Render("  (Pending)"))
+		}
+	} else {
+		lines = append(lines, renderMarkdownLines(trans, textMaxW, TransStyle)...)
+		if t.translating {
+			lines = append(lines, fmt.Sprintf("  %s", WarnStyle.Render(SpinnerFrames[spinTick])))
+		}
+	}
+	lines = append(lines, "")
+	return lines
+}
+
+// renderMarkdownLines renders markdown-formatted text into TUI display lines.
+// Block elements handled: headings, bullets (- /*), numbered lists, blockquotes.
+// Inline: **bold** markers are stripped (keeping text).
+func renderMarkdownLines(text string, maxW int, baseStyle lipgloss.Style) []string {
+	headingStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#E8E8E8"))
+	blockquoteStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#888888")).Italic(true)
+
+	var lines []string
+	for _, raw := range strings.Split(text, "\n") {
+		line := strings.TrimRight(raw, " \t")
+
+		// Blank line
 		if line == "" {
 			lines = append(lines, "")
 			continue
 		}
-		if lipgloss.Width(line) > textMaxW {
-			for _, wrapped := range wordWrapDisplay(line, textMaxW) {
-				lines = append(lines, TransStyle.Render("  "+wrapped))
+
+		// Headings
+		if strings.HasPrefix(line, "### ") {
+			content := stripInlineMarkdown(line[4:])
+			for _, w := range wordWrapDisplay(content, maxW-2) {
+				lines = append(lines, headingStyle.Render("  "+w))
 			}
-		} else {
-			lines = append(lines, TransStyle.Render("  "+line))
+			continue
+		}
+		if strings.HasPrefix(line, "## ") {
+			content := stripInlineMarkdown(line[3:])
+			for _, w := range wordWrapDisplay(content, maxW-2) {
+				lines = append(lines, headingStyle.Render("  "+w))
+			}
+			continue
+		}
+		if strings.HasPrefix(line, "# ") {
+			content := stripInlineMarkdown(line[2:])
+			for _, w := range wordWrapDisplay(content, maxW-2) {
+				lines = append(lines, headingStyle.Render("  "+w))
+			}
+			continue
+		}
+
+		// Bullet list: "- " or "* "
+		if strings.HasPrefix(line, "- ") || strings.HasPrefix(line, "* ") {
+			content := stripInlineMarkdown(line[2:])
+			wrapped := wordWrapDisplay(content, maxW-4)
+			for i, w := range wrapped {
+				if i == 0 {
+					lines = append(lines, baseStyle.Render("  • "+w))
+				} else {
+					lines = append(lines, baseStyle.Render("    "+w))
+				}
+			}
+			continue
+		}
+
+		// Numbered list: "N. "
+		if idx := strings.Index(line, ". "); idx > 0 && idx <= 3 {
+			num := line[:idx]
+			allDigits := true
+			for _, c := range num {
+				if c < '0' || c > '9' {
+					allDigits = false
+					break
+				}
+			}
+			if allDigits {
+				content := stripInlineMarkdown(line[idx+2:])
+				wrapped := wordWrapDisplay(content, maxW-6)
+				for i, w := range wrapped {
+					if i == 0 {
+						lines = append(lines, baseStyle.Render("  "+num+". "+w))
+					} else {
+						lines = append(lines, baseStyle.Render("     "+w))
+					}
+				}
+				continue
+			}
+		}
+
+		// Blockquote: "> "
+		if strings.HasPrefix(line, "> ") {
+			content := stripInlineMarkdown(line[2:])
+			for _, w := range wordWrapDisplay(content, maxW-4) {
+				lines = append(lines, blockquoteStyle.Render("  │ "+w))
+			}
+			continue
+		}
+
+		// Normal paragraph
+		content := stripInlineMarkdown(line)
+		for _, w := range wordWrapDisplay(content, maxW) {
+			lines = append(lines, baseStyle.Render("  "+w))
 		}
 	}
-	if t.translating {
-		spin := WarnStyle.Render(SpinnerFrames[spinTick])
-		lines = append(lines, fmt.Sprintf("  %s", spin))
-	}
 	return lines
+}
+
+// stripInlineMarkdown removes inline markdown markers (**, *, ``) from text.
+func stripInlineMarkdown(s string) string {
+	// Remove **bold** and *italic* markers, keep content
+	var out strings.Builder
+	i := 0
+	runes := []rune(s)
+	for i < len(runes) {
+		if i+1 < len(runes) && runes[i] == '*' && runes[i+1] == '*' {
+			i += 2 // skip **
+			continue
+		}
+		if runes[i] == '*' {
+			i++ // skip *
+			continue
+		}
+		if runes[i] == '`' {
+			i++ // skip `
+			continue
+		}
+		out.WriteRune(runes[i])
+		i++
+	}
+	return out.String()
+}
+
+// truncateDisplay truncates s to at most maxCols display columns.
+func truncateDisplay(s string, maxCols int) string {
+	if maxCols <= 0 {
+		return ""
+	}
+	runes := []rune(s)
+	w := 0
+	for i, r := range runes {
+		rw := lipgloss.Width(string(r))
+		if w+rw > maxCols {
+			return string(runes[:i]) + "…"
+		}
+		w += rw
+	}
+	return s
 }
 
 // ── renderPanel ────────────────────────────────────────────────────────────────
@@ -1360,51 +1686,6 @@ func dbgf(format string, args ...any) string {
 	return fmt.Sprintf("[%s] %s", time.Now().Format("15:04:05"), fmt.Sprintf(format, args...))
 }
 
-// saveCurrentTabCmd writes the current tab's translations to a /tmp file.
-func (m ViewerModel) saveCurrentTabCmd() tea.Cmd {
-	return func() tea.Msg {
-		var sb strings.Builder
-		switch m.activeTab {
-		case TabRealtime:
-			for i := len(m.rtTurns) - 1; i >= 0; i-- {
-				t := m.rtTurns[i]
-				if t.userMsg != "" {
-					sb.WriteString("Q: " + t.userMsg + "\n\n")
-				}
-				sb.WriteString(t.translationStr())
-				sb.WriteString("\n\n---\n\n")
-			}
-		case TabLiveStream:
-			for i := len(m.tsTurns) - 1; i >= 0; i-- {
-				sb.WriteString(m.tsTurns[i].translationStr())
-				sb.WriteString("\n\n---\n\n")
-			}
-		case TabHistorySessions:
-			for i := len(m.hsTurns) - 1; i >= 0; i-- {
-				t := m.hsTurns[i]
-				if t.userMsg != "" {
-					sb.WriteString("Q: " + t.userMsg + "\n\n")
-				}
-				sb.WriteString(t.translationStr())
-				sb.WriteString("\n\n---\n\n")
-			}
-		case TabHistoryAll:
-			if m.haEntry != nil {
-				sb.WriteString(m.haEntry.translationStr())
-			}
-		}
-		content := strings.TrimSpace(sb.String())
-		if content == "" {
-			return StatusMsg{Text: "No content to save", OK: false}
-		}
-		fname := fmt.Sprintf("/tmp/copilot-watcher-%s.txt", time.Now().Format("20060102-150405"))
-		if err := os.WriteFile(fname, []byte(content+"\n"), 0644); err != nil {
-			return StatusMsg{Text: "Save failed: " + err.Error(), OK: false}
-		}
-		return StatusMsg{Text: "Saved → " + fname, OK: true}
-	}
-}
-
 // fmtShort returns a short display string for an output format code.
 func fmtShort(format string) string {
 	switch format {
@@ -1416,7 +1697,7 @@ func fmtShort(format string) string {
 		return "casual"
 	default:
 		if format == "" {
-			return "bullets"
+			return "casual"
 		}
 		if len(format) > 12 {
 			return format[:12] + "…"
