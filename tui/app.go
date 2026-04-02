@@ -7,7 +7,6 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/copilot-watcher/copilot-watcher/config"
 	"github.com/copilot-watcher/copilot-watcher/session"
-	"github.com/copilot-watcher/copilot-watcher/terminal"
 	"github.com/copilot-watcher/copilot-watcher/translator"
 )
 
@@ -21,17 +20,18 @@ const (
 
 // AppModel is the root bubbletea model.
 type AppModel struct {
-	screen        appScreen
-	selector      SelectorModel
-	viewer        *ViewerModel
-	settings      SettingsModel
-	trans         *translator.Translator
-	outputLang    string
-	width         int
-	height        int
-	fatalErr      error
-	sdkLogCh      chan string
-	sdkRetryCount int
+	screen          appScreen
+	selector        SelectorModel
+	viewer          *ViewerModel
+	settings        SettingsModel
+	trans           *translator.Translator
+	outputLang      string
+	width           int
+	height          int
+	fatalErr        error
+	sdkLogCh        chan string
+	sdkRetryCount   int
+	pendingSession  *session.SessionInfo
 }
 
 // translatorReadyMsg is sent when the Copilot SDK client is initialized.
@@ -48,9 +48,8 @@ type sdkRetryMsg struct{}
 
 // viewerReadyMsg is sent when the viewer's watchers are started.
 type viewerReadyMsg struct {
-	watcher    *session.Watcher
-	termReader *terminal.Reader
-	steps      []InitStepMsg
+	watcher *session.Watcher
+	steps   []InitStepMsg
 }
 
 // initTranslatorCmd starts the Copilot SDK client asynchronously.
@@ -73,7 +72,7 @@ func waitForSDKLog(ch chan string) tea.Cmd {
 }
 
 // startViewerCmd starts watchers and returns them via viewerReadyMsg.
-func startViewerCmd(info session.SessionInfo, trans *translator.Translator, teeFilePath string) tea.Cmd {
+func startViewerCmd(info session.SessionInfo, trans *translator.Translator) tea.Cmd {
 	return func() tea.Msg {
 		var steps []InitStepMsg
 
@@ -87,20 +86,7 @@ func startViewerCmd(info session.SessionInfo, trans *translator.Translator, teeF
 			steps = append(steps, InitStepMsg{Step: "JSONL watcher started (events.jsonl)", OK: true})
 		}
 
-		// Start terminal reader: try tee file first, then PTY (best effort)
-		var termReader *terminal.Reader
-		r := terminal.NewReaderWithTee(info.PID, teeFilePath)
-		if err := r.Start(); err != nil {
-			steps = append(steps, InitStepMsg{
-				Step: fmt.Sprintf("Terminal reader: %v (falling back to events.jsonl only)", err),
-				OK:   true, // non-fatal
-			})
-		} else {
-			termReader = r
-			steps = append(steps, InitStepMsg{Step: "Terminal reader started (PTY/console)", OK: true})
-		}
-
-		return viewerReadyMsg{watcher: watcher, termReader: termReader, steps: steps}
+		return viewerReadyMsg{watcher: watcher, steps: steps}
 	}
 }
 
@@ -122,14 +108,8 @@ func (m *AppModel) Close() {
 		if m.viewer.watcher != nil {
 			m.viewer.watcher.Stop()
 		}
-		if m.viewer.termReader != nil {
-			m.viewer.termReader.Stop()
-		}
 		if m.viewer.rtCancel != nil {
 			m.viewer.rtCancel()
-		}
-		if m.viewer.tsCancel != nil {
-			m.viewer.tsCancel()
 		}
 		if m.viewer.hsCancel != nil {
 			m.viewer.hsCancel()
@@ -213,6 +193,22 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.selector.err = fmt.Errorf("Copilot SDK init failed after 5 attempts: %v", msg.err)
 		} else {
 			m.trans = msg.trans
+			// If a session was pending, open it now
+			if m.pendingSession != nil {
+				pending := m.pendingSession
+				m.pendingSession = nil
+				m.selector.err = nil
+				m.screen = screenViewer
+				vm := NewViewerModel(*pending, m.trans, m.selector.sessions)
+				vm.width, vm.height = m.width, m.height
+				vm.outputLang = m.trans.GetLanguage()
+				vm.outputFormat = m.trans.GetFormat()
+				m.viewer = &vm
+				return m, tea.Batch(
+					m.viewer.Init(),
+					startViewerCmd(*pending, m.trans),
+				)
+			}
 		}
 		return m, nil
 
@@ -231,7 +227,9 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case SessionSelectedMsg:
 		if m.trans == nil {
-			m.selector.err = fmt.Errorf("Copilot SDK not ready yet, please wait a moment and try again")
+			sess := msg.Session
+			m.pendingSession = &sess
+			m.selector.err = fmt.Errorf("Copilot SDK initializing, will open session automatically...")
 			return m, nil
 		}
 		m.screen = screenViewer
@@ -242,16 +240,15 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.viewer = &vm
 		return m, tea.Batch(
 			m.viewer.Init(),
-			startViewerCmd(msg.Session, m.trans, vm.teeFilePath),
+			startViewerCmd(msg.Session, m.trans),
 		)
 
 	case viewerReadyMsg:
 		if m.viewer != nil {
 			m.viewer.watcher = msg.watcher
-			m.viewer.termReader = msg.termReader
-			// If no JSONL watcher and no term reader, default to history-all
-			if m.viewer.watcher == nil && m.viewer.termReader == nil {
-				m.viewer.activeTab = TabHistoryAll
+			// If no JSONL watcher, default to history sessions tab
+			if m.viewer.watcher == nil {
+				m.viewer.activeTab = TabHistorySessions
 			}
 		}
 		var cmds []tea.Cmd
@@ -262,9 +259,9 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmds = append(cmds, func() tea.Msg { return StatusMsg{Text: "Monitoring", OK: true} })
 		if m.viewer != nil {
 			cmds = append(cmds, m.viewer.WatchChannels())
-			// If defaulting to history-all, trigger initial load
-			if m.viewer.activeTab == TabHistoryAll {
-				cmds = append(cmds, loadHistoryAllCmd(m.viewer.allSessions))
+			// If defaulting to history-sessions, trigger initial load
+			if m.viewer.activeTab == TabHistorySessions {
+				cmds = append(cmds, loadHistorySessionsCmd(m.viewer.info.EventsPath))
 			}
 		}
 		return m, tea.Batch(cmds...)
@@ -309,14 +306,8 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.viewer.watcher != nil {
 				m.viewer.watcher.Stop()
 			}
-			if m.viewer.termReader != nil {
-				m.viewer.termReader.Stop()
-			}
 			if m.viewer.rtCancel != nil {
 				m.viewer.rtCancel()
-			}
-			if m.viewer.tsCancel != nil {
-				m.viewer.tsCancel()
 			}
 			if m.viewer.hsCancel != nil {
 				m.viewer.hsCancel()
@@ -331,13 +322,11 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(m.selector.Init(), DetectSessionsCmd())
 
 	// Viewer messages
-	case ReasoningDetectedMsg, TerminalChunkMsg,
+	case ReasoningDetectedMsg,
 		RTChunkMsg, RTDoneMsg,
-		TSChunkMsg, TSDoneMsg, tsDebounceMsg,
 		HSLoadedMsg, HSChunkMsg, HSDoneMsg,
 		HALoadedMsg, HAChunkMsg, HADoneMsg,
 		WatcherDebugMsg,
-		teeCheckMsg,
 		HistoryLoadedMsg, StatusMsg, InitStepMsg, spinnerTickMsg:
 		if m.viewer != nil {
 			updated, cmd := m.viewer.Update(msg)

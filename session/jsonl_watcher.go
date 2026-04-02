@@ -23,6 +23,7 @@ type ReasoningMsg struct {
 	ReasoningText string
 	ContentText   string // non-reasoning AI response content
 	Timestamp     time.Time
+	Partial       bool // true when this is a streaming snippet, not a complete turn
 }
 
 // Watcher tails events.jsonl and emits ReasoningMsg via a channel.
@@ -193,6 +194,21 @@ func (w *Watcher) processLine(line []byte, pendingUser *string, pendingReasoning
 			return
 		}
 		if d.ReasoningText != "" {
+			// Emit partial msg with just the new snippet before accumulating
+			ts := *pendingTS
+			if ts.IsZero() {
+				ts = time.Now()
+			}
+			select {
+			case w.ch <- ReasoningMsg{
+				SessionID:     w.sessionID,
+				UserMessage:   *pendingUser,
+				ReasoningText: d.ReasoningText,
+				Timestamp:     ts,
+				Partial:       true,
+			}:
+			default:
+			}
 			*pendingReasoning += d.ReasoningText
 			w.sendDbg(fmt.Sprintf("assistant.message (reasoningText): %d chars accumulated", len(*pendingReasoning)))
 		}

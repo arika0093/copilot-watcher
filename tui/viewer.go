@@ -3,15 +3,12 @@ package tui
 import (
 	"context"
 	"fmt"
-	"os"
-	"os/exec"
 	"strings"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/copilot-watcher/copilot-watcher/session"
-	"github.com/copilot-watcher/copilot-watcher/terminal"
 	"github.com/copilot-watcher/copilot-watcher/translator"
 )
 
@@ -21,7 +18,6 @@ type TabID int
 
 const (
 	TabRealtime        TabID = iota // events.jsonl based
-	TabLiveStream                   // terminal fd/PTY near-real-time
 	TabHistorySessions              // per-session AI summary
 	TabHistoryAll                   // combined summary of all sessions
 	TabDebug                        // initialization log and debug messages
@@ -30,7 +26,6 @@ const (
 // ── Tea messages ───────────────────────────────────────────────────────────────
 
 type ReasoningDetectedMsg session.ReasoningMsg
-type TerminalChunkMsg terminal.TerminalMsg
 
 // Real-time tab translation
 type RTChunkMsg struct {
@@ -39,22 +34,11 @@ type RTChunkMsg struct {
 }
 type RTDoneMsg struct{ Idx int }
 
-// Live Stream tab translation
-type TSChunkMsg struct {
-	Idx  int
-	Text string
-}
-type TSDoneMsg struct{ Idx int }
-type tsDebounceMsg struct{ seq int }
-
 // History: Sessions tab
 type HSLoadedMsg struct {
 	Turns []session.Turn
 	Err   error
 }
-
-// teeCheckMsg fires periodically to detect a newly-appeared tee stream file.
-type teeCheckMsg struct{}
 
 type HSChunkMsg struct {
 	Idx  int
@@ -119,22 +103,16 @@ type ViewerModel struct {
 	activeTab TabID
 
 	// Real-time tab (events.jsonl)
-	rtTurns  []*viewTurn
-	rtCursor int // 0 = newest, increments toward older
-	rtQ      []int
-	rtCh     <-chan string
-	rtCancel context.CancelFunc
-
-	// Live Stream tab (terminal fd/PTY)
-	tsTurns  []*viewTurn
-	tsBuffer strings.Builder
-	tsSeq    int
-	tsCh     <-chan string
-	tsCancel context.CancelFunc
+	rtTurns      []*viewTurn
+	rtCursor     int // 0 = newest, increments toward older
+	rtQ          []int
+	rtCh         <-chan string
+	rtCancel     context.CancelFunc
+	rtStreamMode bool // false = turn-by-turn mode, true = streaming (live) mode
 
 	// History: Turns tab (per-request of the current session)
 	hsTurns      []*viewTurn
-	hsCursor     int  // 0 = newest, increments toward older
+	hsCursor     int   // 0 = newest, increments toward older
 	hsQ          []int // translation queue (indices), newest first
 	hsGeneration int   // incremented per new translation to discard stale msgs
 	hsCh         <-chan string
@@ -160,17 +138,10 @@ type ViewerModel struct {
 
 	spinnerTick int
 
-	startTime   time.Time // when the viewer was created (used for tee-file freshness check)
-	teeFilePath string    // path to /tmp/copilot-watcher-stream
-	hasTmux     bool      // true if tmux is available on PATH
-
-	watcher    *session.Watcher
-	termReader *terminal.Reader
+	watcher *session.Watcher
 }
 
 func NewViewerModel(info session.SessionInfo, trans *translator.Translator, allSessions []session.SessionInfo) ViewerModel {
-	teeFilePath := "/tmp/copilot-watcher-stream"
-	_, hasTmux := exec.LookPath("tmux")
 	return ViewerModel{
 		info:         info,
 		trans:        trans,
@@ -181,9 +152,6 @@ func NewViewerModel(info session.SessionInfo, trans *translator.Translator, allS
 		statusOK:     false,
 		outputLang:   trans.GetLanguage(),
 		outputFormat: trans.GetFormat(),
-		startTime:    time.Now(),
-		teeFilePath:  teeFilePath,
-		hasTmux:      hasTmux == nil,
 	}
 }
 
@@ -194,7 +162,6 @@ func (m ViewerModel) Init() tea.Cmd {
 			return InitStepMsg{Step: "Session selected: " + m.info.SessionID[:8], OK: true}
 		},
 		spinnerCmd(),
-		teeCheckCmd(),
 	)
 }
 
@@ -253,9 +220,6 @@ func (m *ViewerModel) WatchChannels() tea.Cmd {
 		cmds = append(cmds, waitForReasoning(m.watcher.Chan()))
 		cmds = append(cmds, waitForWatcherDebug(m.watcher.DebugChan()))
 	}
-	if m.termReader != nil {
-		cmds = append(cmds, waitForTerminal(m.termReader.Chan()))
-	}
 	return tea.Batch(cmds...)
 }
 
@@ -279,16 +243,6 @@ func waitForReasoning(ch <-chan session.ReasoningMsg) tea.Cmd {
 	}
 }
 
-func waitForTerminal(ch <-chan terminal.TerminalMsg) tea.Cmd {
-	return func() tea.Msg {
-		msg, ok := <-ch
-		if !ok {
-			return nil
-		}
-		return TerminalChunkMsg(msg)
-	}
-}
-
 func waitForRTChunk(idx int, ch <-chan string) tea.Cmd {
 	return func() tea.Msg {
 		text, ok := <-ch
@@ -307,25 +261,6 @@ func waitForHSChunk(idx, gen int, ch <-chan string) tea.Cmd {
 		}
 		return HSChunkMsg{Idx: idx, Gen: gen, Text: text}
 	}
-}
-
-func waitForTSChunk(idx int, ch <-chan string) tea.Cmd {
-	return func() tea.Msg {
-		text, ok := <-ch
-		if !ok {
-			return TSDoneMsg{Idx: idx}
-		}
-		return TSChunkMsg{Idx: idx, Text: text}
-	}
-}
-
-func tsDebounceCmd(seq int) tea.Cmd {
-	return tea.Tick(2*time.Second, func(_ time.Time) tea.Msg { return tsDebounceMsg{seq: seq} })
-}
-
-
-func teeCheckCmd() tea.Cmd {
-	return tea.Tick(2*time.Second, func(_ time.Time) tea.Msg { return teeCheckMsg{} })
 }
 
 func waitForHAChunk(ch <-chan string) tea.Cmd {
@@ -457,37 +392,6 @@ func (m *ViewerModel) startHA() tea.Cmd {
 	return tea.Batch(waitForHAChunk(ch), spinnerCmd())
 }
 
-// startTS flushes the terminal buffer into a new Live Stream turn and translates it.
-func (m *ViewerModel) startTS() tea.Cmd {
-	raw := strings.TrimSpace(m.tsBuffer.String())
-	m.tsBuffer.Reset()
-	if raw == "" {
-		return nil
-	}
-	idx := len(m.tsTurns)
-	vt := &viewTurn{
-		turnNum:   idx + 1,
-		label:     "Live Stream",
-		reasoning: raw,
-		timestamp: time.Now(),
-	}
-	m.tsTurns = append(m.tsTurns, vt)
-	if m.tsCancel != nil {
-		m.tsCancel()
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
-	m.tsCancel = cancel
-	ch, err := m.trans.Translate(ctx, raw)
-	if err != nil {
-		vt.translation.WriteString(fmt.Sprintf("Translation error: %v", err))
-		vt.done = true
-		return nil
-	}
-	vt.translating = true
-	m.tsCh = ch
-	return tea.Batch(waitForTSChunk(idx, ch), spinnerCmd())
-}
-
 // ── Update ─────────────────────────────────────────────────────────────────────
 
 func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
@@ -503,14 +407,6 @@ func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
 			if t.translating {
 				anyActive = true
 				break
-			}
-		}
-		if !anyActive {
-			for _, t := range m.tsTurns {
-				if t.translating {
-					anyActive = true
-					break
-				}
 			}
 		}
 		if !anyActive {
@@ -588,10 +484,96 @@ func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
 			}
 		}
 		return m, func() tea.Msg {
-			return InitStepMsg{Step: fmt.Sprintf("Session has %d history turns (tab [3] to view)", n), OK: true}
+			return InitStepMsg{Step: fmt.Sprintf("Session has %d history turns (tab [2] to view)", n), OK: true}
 		}
 
 	case ReasoningDetectedMsg:
+		if msg.Partial {
+			if !m.rtStreamMode {
+				// In turn mode: ignore partial msgs entirely
+				if m.watcher != nil {
+					return m, waitForReasoning(m.watcher.Chan())
+				}
+				return m, nil
+			}
+			// Stream mode: find or create open partial turn
+			var cmds []tea.Cmd
+			if m.watcher != nil {
+				cmds = append(cmds, waitForReasoning(m.watcher.Chan()))
+			}
+			// Find existing open turn with same userMsg
+			foundIdx := -1
+			for i := len(m.rtTurns) - 1; i >= 0; i-- {
+				if m.rtTurns[i].userMsg == msg.UserMessage && !m.rtTurns[i].done {
+					foundIdx = i
+					break
+				}
+			}
+			if foundIdx >= 0 {
+				// Append to existing open turn and re-queue for translation
+				t := m.rtTurns[foundIdx]
+				t.reasoning += msg.ReasoningText
+				// Re-queue with priority (cancel old translation, start fresh)
+				m.rtQ = append([]int{foundIdx}, m.rtQ...)
+				cmds = append(cmds, m.startNextRT())
+			} else {
+				// Create new open partial turn
+				vt := &viewTurn{
+					turnNum:     len(m.rtTurns) + 1,
+					userMsg:     msg.UserMessage,
+					reasoning:   msg.ReasoningText,
+					isReasoning: true,
+					done:        false,
+					timestamp:   msg.Timestamp,
+				}
+				m.rtTurns = append(m.rtTurns, vt)
+				idx := len(m.rtTurns) - 1
+				m.rtQ = append([]int{idx}, m.rtQ...)
+				cmds = append(cmds, m.startNextRT())
+			}
+			m.debugLog = append(m.debugLog, dbgf("RT partial snippet detected (%d chars)", len(msg.ReasoningText)))
+			return m, tea.Batch(cmds...)
+		}
+		// Partial=false: final turn_end msg
+		if m.rtStreamMode {
+			// Stream mode: find open partial turn and mark done
+			for i := len(m.rtTurns) - 1; i >= 0; i-- {
+				if m.rtTurns[i].userMsg == msg.UserMessage && !m.rtTurns[i].done {
+					m.rtTurns[i].done = true
+					// Update full content if available
+					if msg.ContentText != "" {
+						m.rtTurns[i].response = msg.ContentText
+					}
+					m.debugLog = append(m.debugLog, dbgf("RT stream turn #%d finalized", i+1))
+					break
+				}
+			}
+			var cmds []tea.Cmd
+			if m.watcher != nil {
+				cmds = append(cmds, waitForReasoning(m.watcher.Chan()))
+			}
+			// Also update hsTurns
+			hsVt := &viewTurn{
+				turnNum:     len(m.hsTurns) + 1,
+				userMsg:     msg.UserMessage,
+				reasoning:   msg.ReasoningText,
+				response:    msg.ContentText,
+				isReasoning: msg.ReasoningText != "",
+				timestamp:   msg.Timestamp,
+			}
+			m.hsTurns = append(m.hsTurns, hsVt)
+			hsIdx := len(m.hsTurns) - 1
+			if hsVt.isReasoning {
+				m.hsQ = append([]int{hsIdx}, m.hsQ...)
+			} else {
+				hsVt.done = true
+			}
+			if m.activeTab == TabHistorySessions && m.hsCursor == 0 {
+				cmds = append(cmds, m.startHSAtCursor())
+			}
+			return m, tea.Batch(cmds...)
+		}
+		// Turn mode (default): existing behavior
 		vt := &viewTurn{
 			turnNum:     len(m.rtTurns) + 1,
 			userMsg:     msg.UserMessage,
@@ -661,48 +643,6 @@ func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
 			}
 		}
 		return m, m.startNextRT()
-
-	case TerminalChunkMsg:
-		// Accumulate text for Live Stream tab; debounce to batch translate
-		m.tsBuffer.WriteString(msg.Text)
-		m.tsSeq++
-		seq := m.tsSeq
-		var cmds []tea.Cmd
-		if m.termReader != nil {
-			cmds = append(cmds, waitForTerminal(m.termReader.Chan()))
-		}
-		cmds = append(cmds, tsDebounceCmd(seq))
-		return m, tea.Batch(cmds...)
-
-	case tsDebounceMsg:
-		// Only translate if no newer chunks arrived since this debounce was scheduled
-		if msg.seq == m.tsSeq {
-			m.debugLog = append(m.debugLog, dbgf("LIVE debounce fired (seq=%d), buffer=%d bytes → translating", msg.seq, m.tsBuffer.Len()))
-			return m, m.startTS()
-		}
-
-	case TSChunkMsg:
-		if msg.Idx < len(m.tsTurns) {
-			t := m.tsTurns[msg.Idx]
-			if strings.HasPrefix(msg.Text, translator.StreamErrPrefix) {
-				t.errMsg = strings.TrimPrefix(msg.Text, translator.StreamErrPrefix)
-			} else {
-				t.translation.WriteString(msg.Text)
-			}
-		}
-		return m, waitForTSChunk(msg.Idx, m.tsCh)
-
-	case TSDoneMsg:
-		if msg.Idx < len(m.tsTurns) {
-			t := m.tsTurns[msg.Idx]
-			t.translating = false
-			t.done = true
-			if t.errMsg != "" {
-				m.debugLog = append(m.debugLog, dbgf("LIVE turn #%d API error: %s", msg.Idx+1, t.errMsg))
-			} else {
-				m.debugLog = append(m.debugLog, dbgf("LIVE turn #%d translation complete (%d chars)", msg.Idx+1, len(t.translationStr())))
-			}
-		}
 
 	// History: Turns tab
 	case HSLoadedMsg:
@@ -818,21 +758,6 @@ func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
 	case SDKLogMsg:
 		m.debugLog = append(m.debugLog, dbgf("SDK %s", msg.Text))
 
-	case teeCheckMsg:
-		if m.termReader == nil && m.teeFilePath != "" {
-			info, err := os.Stat(m.teeFilePath)
-			if err == nil && info.ModTime().After(m.startTime.Add(-30*time.Second)) {
-				r := terminal.NewReaderWithTee(m.info.PID, m.teeFilePath)
-				if startErr := r.Start(); startErr == nil {
-					m.termReader = r
-					m.debugLog = append(m.debugLog, dbgf("TEE file appeared, started live stream from %s", m.teeFilePath))
-					return m, waitForTerminal(r.Chan())
-				}
-			}
-			// File not ready yet, check again later
-			return m, teeCheckCmd()
-		}
-
 	case tea.MouseMsg:
 		switch msg.Button {
 		case tea.MouseButtonWheelUp:
@@ -851,15 +776,12 @@ func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
 			m.activeTab = TabRealtime
 			m.debugLog = append(m.debugLog, dbgf("TAB switched to Reasoning"))
 		case "2":
-			m.activeTab = TabLiveStream
-			m.debugLog = append(m.debugLog, dbgf("TAB switched to Live Stream"))
-		case "3":
 			m.activeTab = TabHistorySessions
 			m.debugLog = append(m.debugLog, dbgf("TAB switched to Requests"))
 			if m.trans != nil {
 				return m, m.startHSAtCursor()
 			}
-		case "4":
+		case "3":
 			// Always reload all-sessions summary when switching to this tab
 			m.activeTab = TabHistoryAll
 			if m.haCancel != nil {
@@ -872,8 +794,18 @@ func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
 				func() tea.Msg { return InitStepMsg{Step: "Refreshing all-sessions summary...", OK: true} },
 				loadHistoryAllCmd(m.allSessions),
 			)
-		case "5":
+		case "4":
 			m.activeTab = TabDebug
+		case "m":
+			if m.activeTab == TabRealtime {
+				m.rtStreamMode = !m.rtStreamMode
+				m.scroll[m.activeTab] = 0
+				if m.rtStreamMode {
+					m.debugLog = append(m.debugLog, dbgf("RT mode switched to streaming (live)"))
+				} else {
+					m.debugLog = append(m.debugLog, dbgf("RT mode switched to turn-by-turn"))
+				}
+			}
 		case "up", "k":
 			if m.scroll[m.activeTab] > 0 {
 				m.scroll[m.activeTab]--
@@ -1027,7 +959,7 @@ func (m ViewerModel) View() string {
 		scrollInfo = fmt.Sprintf("   [%d/%d lines]", offset+1, len(allLines))
 	}
 	help := HelpStyle.Render(fmt.Sprintf(
-		"  [esc/b] back   [1-5] tab   [↑↓/kj] scroll   [g/G] top/bottom   [q] quit%s",
+		"  [esc/b] back   [1-4] tab   [↑↓/kj] scroll   [g/G] top/bottom   [q] quit%s",
 		scrollInfo,
 	))
 	sb.WriteString(help)
@@ -1040,19 +972,15 @@ func (m ViewerModel) renderTabBar(w int) string {
 		label string
 	}
 	tabs := []tabDef{
-		{TabRealtime, "[1] Reasoning"},
-		{TabLiveStream, "[2] Live Stream"},
-		{TabHistorySessions, "[3] Requests"},
-		{TabHistoryAll, "[4] All"},
-		{TabDebug, "[5] Debug"},
+		{TabRealtime, "[1] Live"},
+		{TabHistorySessions, "[2] Requests"},
+		{TabHistoryAll, "[3] All"},
+		{TabDebug, "[4] Debug"},
 	}
 	var parts []string
 	for _, td := range tabs {
 		extra := ""
 		if td.id == TabRealtime && len(m.rtTurns) > 0 {
-			extra = " ●"
-		}
-		if td.id == TabLiveStream && len(m.tsTurns) > 0 {
 			extra = " ●"
 		}
 		label := td.label + extra
@@ -1071,23 +999,12 @@ func (m ViewerModel) buildPanelTitle() string {
 	var title string
 	switch m.activeTab {
 	case TabRealtime:
-		title = " Reasoning"
+		title = " Live"
 		for _, t := range m.rtTurns {
 			if t.translating {
-				title += " " + WarnStyle.Render(SpinnerFrames[m.spinnerTick]+" translating")
+				title += " · " + WarnStyle.Render(SpinnerFrames[m.spinnerTick]+" translating")
 				break
 			}
-		}
-	case TabLiveStream:
-		title = " Live Stream (Terminal)"
-		for _, t := range m.tsTurns {
-			if t.translating {
-				title += " " + WarnStyle.Render(SpinnerFrames[m.spinnerTick]+" translating")
-				break
-			}
-		}
-		if m.tsBuffer.Len() > 0 {
-			title += " " + MutedStyle.Render(fmt.Sprintf(" [buffering %d bytes…]", m.tsBuffer.Len()))
 		}
 	case TabHistorySessions:
 		title = " Requests"
@@ -1099,12 +1016,12 @@ func (m ViewerModel) buildPanelTitle() string {
 			}
 		}
 		if anyTranslating {
-			title += " " + WarnStyle.Render(SpinnerFrames[m.spinnerTick]+" translating")
+			title += " · " + WarnStyle.Render(SpinnerFrames[m.spinnerTick]+" translating")
 		}
 	case TabHistoryAll:
 		title = " All Sessions"
 		if m.haEntry != nil && m.haEntry.translating {
-			title += " " + WarnStyle.Render(SpinnerFrames[m.spinnerTick]+" summarizing")
+			title += " · " + WarnStyle.Render(SpinnerFrames[m.spinnerTick]+" summarizing")
 		}
 	case TabDebug:
 		title = " Debug / Init Log"
@@ -1117,8 +1034,6 @@ func (m ViewerModel) buildTabLines(w int) []string {
 	switch m.activeTab {
 	case TabRealtime:
 		return m.buildRTLines(w)
-	case TabLiveStream:
-		return m.buildTSLines(w)
 	case TabHistorySessions:
 		return m.buildHSLines(w)
 	case TabHistoryAll:
@@ -1150,85 +1065,13 @@ func (m ViewerModel) buildRTLines(w int) []string {
 	total := len(m.rtTurns)
 
 	lines := buildNavBar(cursor, total, "Reasoning", t.timestamp, w)
+	if m.rtStreamMode {
+		lines = append(lines, MutedStyle.Render("  Mode: [m] streaming (live)"))
+	} else {
+		lines = append(lines, MutedStyle.Render("  Mode: [m] turn-by-turn"))
+	}
 	lines = append(lines, "")
 	lines = append(lines, buildTurnBlock(t, w, m.spinnerTick)...)
-	return lines
-}
-
-func (m ViewerModel) buildTSLines(w int) []string {
-	if m.termReader == nil {
-		teePathDisplay := "/tmp/copilot-watcher-stream"
-		if m.teeFilePath != "" {
-			teePathDisplay = m.teeFilePath
-		}
-		lines := []string{
-			"",
-			WarnStyle.Render("  Live Stream: no active terminal capture detected."),
-			"",
-			MutedStyle.Render("  Start capturing in a separate terminal window, then copilot-watcher"),
-			MutedStyle.Render("  will pick it up automatically within a few seconds."),
-			"",
-		}
-		// tmux option (shown first, if available)
-		if m.hasTmux {
-			lines = append(lines,
-				ActiveStyle.Render("  Option 1 — tmux (recommended if copilot is already running in tmux):"),
-				TextStyle.Render("    tmux pipe-pane -o 'cat >> "+teePathDisplay+"'"),
-				MutedStyle.Render("    Run this in any tmux window. It pipes the active pane's output to the file."),
-				MutedStyle.Render("    To stop: tmux pipe-pane  (no arguments)"),
-				"",
-				ActiveStyle.Render("  Option 2 — script (start copilot inside a recording shell):"),
-			)
-		} else {
-			lines = append(lines,
-				ActiveStyle.Render("  script — start copilot inside a recording shell:"),
-			)
-		}
-		lines = append(lines,
-			MutedStyle.Render("    Step 1: Open a new terminal (separate from this one) and run:"),
-		)
-		if m.hasTmux {
-			lines = append(lines,
-				MutedStyle.Render("    # Linux:"),
-				TextStyle.Render("      script -a -q -f "+teePathDisplay),
-				MutedStyle.Render("    # macOS:"),
-				TextStyle.Render("      script -a -q -F "+teePathDisplay),
-			)
-		} else {
-			// Detect OS hint via GOOS is not available here; show both
-			lines = append(lines,
-				MutedStyle.Render("    # Linux:"),
-				TextStyle.Render("      script -a -q -f "+teePathDisplay),
-				MutedStyle.Render("    # macOS:"),
-				TextStyle.Render("      script -a -q -F "+teePathDisplay),
-			)
-		}
-		lines = append(lines,
-			MutedStyle.Render("    Step 2: A new shell opens — run copilot inside it:"),
-			TextStyle.Render("      gh copilot suggest \"...\""),
-			MutedStyle.Render("    Step 3: When done with copilot, stop the recording:"),
-			TextStyle.Render("      exit"),
-			"",
-			MutedStyle.Render(fmt.Sprintf("  Waiting for %s to appear...", teePathDisplay)),
-			"",
-		)
-		return lines
-	}
-	if len(m.tsTurns) == 0 {
-		return []string{
-			"",
-			WarnStyle.Render("  Listening to terminal output..."),
-			MutedStyle.Render("  Translations will appear after 2s of silence in the terminal."),
-			"",
-		}
-	}
-	var lines []string
-	for i := len(m.tsTurns) - 1; i >= 0; i-- {
-		if i < len(m.tsTurns)-1 {
-			lines = append(lines, MutedStyle.Render("  "+strings.Repeat("─", max(0, w-8))))
-		}
-		lines = append(lines, buildTurnBlock(m.tsTurns[i], w, m.spinnerTick)...)
-	}
 	return lines
 }
 
@@ -1286,10 +1129,10 @@ func buildNavBar(cursor, total int, kind string, ts time.Time, w int) []string {
 	leftStr := DimStyle.Render(fmt.Sprintf("  %s %d / %d", kind, cursor+1, total))
 	var navParts []string
 	if cursor < total-1 {
-		navParts = append(navParts, MutedStyle.Render("[←] older"))
+		navParts = append(navParts, MutedStyle.Render("[<] older"))
 	}
 	if cursor > 0 {
-		navParts = append(navParts, ActiveStyle.Render("[→] newer"))
+		navParts = append(navParts, ActiveStyle.Render("[>] newer"))
 	}
 	navStr := ""
 	if len(navParts) > 0 {
@@ -1341,11 +1184,7 @@ func buildTurnBlock(t *viewTurn, w int, spinTick int) []string {
 		lines = append(lines, MutedStyle.Render("  Q: ")+UserMsgStyle.Render(`"`+um+`"`))
 	}
 
-	if t.timestamp.IsZero() {
-		lines = append(lines, "")
-	} else {
-		lines = append(lines, MutedStyle.Render("  "+fmtAge(t.timestamp)))
-	}
+	lines = append(lines, "")
 
 	if t.isReasoning {
 		// Reasoning turn: full translated block in gray
