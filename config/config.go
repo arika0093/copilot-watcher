@@ -15,6 +15,8 @@ func DefaultConfig() Config {
 	return Config{Language: "Japanese", Format: "conversational"}
 }
 
+var configPathFn = configPath
+
 func configPath() (string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -28,7 +30,7 @@ func configPath() (string, error) {
 }
 
 func Load() (Config, error) {
-	p, err := configPath()
+	p, err := configPathFn()
 	if err != nil {
 		return DefaultConfig(), err
 	}
@@ -54,7 +56,7 @@ func Load() (Config, error) {
 }
 
 func Save(c Config) error {
-	p, err := configPath()
+	p, err := configPathFn()
 	if err != nil {
 		return err
 	}

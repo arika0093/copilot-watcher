@@ -7,7 +7,7 @@ func (r *Reader) startWindows() error {
 	r.wg.Add(1)
 	go func() {
 		defer r.wg.Done()
-		pollConsoleOutput(r.pid, chanToStringChan(r.ch), r.done)
+		pollConsoleOutput(r.pid, r.ch, r.done)
 	}()
 	return nil
 }

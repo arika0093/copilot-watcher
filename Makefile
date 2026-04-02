@@ -1,4 +1,4 @@
-.PHONY: build fmt lint vet clean install
+.PHONY: build fmt lint vet test clean install check
 
 BINARY := copilot-watcher
 GO_FILES := $(shell find . -name '*.go' -not -path './vendor/*')
@@ -15,6 +15,9 @@ lint: fmt
 vet:
 	go vet ./...
 
+test:
+	go test ./...
+
 clean:
 	rm -f $(BINARY)
 
@@ -22,5 +25,5 @@ install: build
 	mv $(BINARY) $(GOPATH)/bin/$(BINARY)
 
 # Run all checks (CI mode)
-check: vet
+check: vet test
 	golangci-lint run ./...

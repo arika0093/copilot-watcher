@@ -20,6 +20,11 @@ const (
 	sessionStateDirName = "session-state"
 )
 
+var (
+	sessionStatePathFn = sessionStatePath
+	pidAliveFn         = isPIDAlive
+)
+
 func copilotDirPath() (string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -40,7 +45,7 @@ func sessionStatePath() (string, error) {
 // Sessions with a live process are marked Active=true; others are included too
 // so the user can browse history even when Copilot CLI is not running.
 func Detect() ([]SessionInfo, error) {
-	stateDir, err := sessionStatePath()
+	stateDir, err := sessionStatePathFn()
 	if err != nil {
 		return nil, err
 	}
@@ -111,7 +116,7 @@ func parseSession(sessionDir, sessionID string) (*SessionInfo, error) {
 		if err != nil {
 			continue
 		}
-		if isPIDAlive(pid) {
+		if pidAliveFn(pid) {
 			info.Active = true
 			info.PID = pid
 			break
@@ -153,7 +158,7 @@ func isPIDAlive(pid int) bool {
 
 // LoadAllSessions returns all sessions regardless of active status, sorted newest first.
 func LoadAllSessions() ([]SessionInfo, error) {
-	stateDir, err := sessionStatePath()
+	stateDir, err := sessionStatePathFn()
 	if err != nil {
 		return nil, err
 	}
@@ -265,6 +270,14 @@ func LoadHistory(eventsPath string) ([]Turn, error) {
 				currentContent = ""
 			}
 		}
+	}
+	if currentUser != "" && (currentReasoning != "" || currentContent != "") {
+		turns = append(turns, Turn{
+			UserMessage:   currentUser,
+			ReasoningText: currentReasoning,
+			Response:      currentContent,
+			Timestamp:     currentTimestamp,
+		})
 	}
 	return turns, scanner.Err()
 }

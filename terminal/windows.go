@@ -112,7 +112,7 @@ func (cr *consoleReader) readConsoleOutput() (string, error) {
 }
 
 // Polling loop - exported for use by Reader
-func pollConsoleOutput(pid int, ch chan<- string, done <-chan struct{}) {
+func pollConsoleOutput(pid int, ch chan<- TerminalMsg, done <-chan struct{}) {
 	cr := &consoleReader{pid: pid}
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
@@ -126,7 +126,7 @@ func pollConsoleOutput(pid int, ch chan<- string, done <-chan struct{}) {
 				continue
 			}
 			select {
-			case ch <- text:
+			case ch <- TerminalMsg{Text: text}:
 			default:
 			}
 		}
