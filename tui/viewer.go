@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"strings"
 	"time"
 
@@ -107,6 +108,7 @@ type viewTurn struct {
 	userMsg     string
 	reasoning   string
 	translation strings.Builder
+	errMsg      string // non-empty when the translation API returned an error
 	translating bool
 	done        bool
 	timestamp   time.Time
@@ -167,6 +169,7 @@ type ViewerModel struct {
 
 	startTime   time.Time // when the viewer was created (used for tee-file freshness check)
 	teeFilePath string    // resolved path to ~/.copilot-watcher-stream
+	hasTmux     bool      // true if tmux is available on PATH
 
 	watcher    *session.Watcher
 	termReader *terminal.Reader
@@ -177,6 +180,7 @@ func NewViewerModel(info session.SessionInfo, trans *translator.Translator, allS
 	if home, err := os.UserHomeDir(); err == nil {
 		teeFilePath = home + "/.copilot-watcher-stream"
 	}
+	_, hasTmux := exec.LookPath("tmux")
 	return ViewerModel{
 		info:         info,
 		trans:        trans,
@@ -190,6 +194,7 @@ func NewViewerModel(info session.SessionInfo, trans *translator.Translator, allS
 		outputFormat: trans.GetFormat(),
 		startTime:    time.Now(),
 		teeFilePath:  teeFilePath,
+		hasTmux:      hasTmux == nil,
 	}
 }
 
@@ -388,7 +393,7 @@ func (m *ViewerModel) startNextRT() tea.Cmd {
 		m.rtCancel = cancel
 		ch, err := m.trans.Translate(ctx, t.reasoning)
 		if err != nil {
-			t.translation.WriteString(fmt.Sprintf("翻訳エラー: %v", err))
+			t.translation.WriteString(fmt.Sprintf("Translation error: %v", err))
 			t.done = true
 			return m.startNextRT()
 		}
@@ -584,7 +589,13 @@ func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
 
 	case RTChunkMsg:
 		if msg.Idx < len(m.rtTurns) {
-			m.rtTurns[msg.Idx].translation.WriteString(msg.Text)
+			t := m.rtTurns[msg.Idx]
+			if strings.HasPrefix(msg.Text, translator.StreamErrPrefix) {
+				t.errMsg = strings.TrimPrefix(msg.Text, translator.StreamErrPrefix)
+				m.debugLog = append(m.debugLog, dbgf("RT turn #%d API error: %s", msg.Idx+1, t.errMsg))
+			} else {
+				t.translation.WriteString(msg.Text)
+			}
 		}
 		return m, waitForRTChunk(msg.Idx, m.rtCh)
 
@@ -593,7 +604,11 @@ func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
 			t := m.rtTurns[msg.Idx]
 			t.translating = false
 			t.done = true
-			m.debugLog = append(m.debugLog, dbgf("RT turn #%d translation complete (%d chars)", msg.Idx+1, len(t.translationStr())))
+			if t.errMsg != "" {
+				m.debugLog = append(m.debugLog, dbgf("RT turn #%d completed with error", msg.Idx+1))
+			} else {
+				m.debugLog = append(m.debugLog, dbgf("RT turn #%d translation complete (%d chars)", msg.Idx+1, len(t.translationStr())))
+			}
 		}
 		return m, m.startNextRT()
 
@@ -618,7 +633,12 @@ func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
 
 	case TSChunkMsg:
 		if msg.Idx < len(m.tsTurns) {
-			m.tsTurns[msg.Idx].translation.WriteString(msg.Text)
+			t := m.tsTurns[msg.Idx]
+			if strings.HasPrefix(msg.Text, translator.StreamErrPrefix) {
+				t.errMsg = strings.TrimPrefix(msg.Text, translator.StreamErrPrefix)
+			} else {
+				t.translation.WriteString(msg.Text)
+			}
 		}
 		return m, waitForTSChunk(msg.Idx, m.tsCh)
 
@@ -627,7 +647,11 @@ func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
 			t := m.tsTurns[msg.Idx]
 			t.translating = false
 			t.done = true
-			m.debugLog = append(m.debugLog, dbgf("LIVE turn #%d translation complete (%d chars)", msg.Idx+1, len(t.translationStr())))
+			if t.errMsg != "" {
+				m.debugLog = append(m.debugLog, dbgf("LIVE turn #%d API error: %s", msg.Idx+1, t.errMsg))
+			} else {
+				m.debugLog = append(m.debugLog, dbgf("LIVE turn #%d translation complete (%d chars)", msg.Idx+1, len(t.translationStr())))
+			}
 		}
 
 	// History: Sessions tab
@@ -680,7 +704,12 @@ func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
 			return m, nil
 		}
 		if msg.Idx < len(m.hsTurns) {
-			m.hsTurns[msg.Idx].translation.WriteString(msg.Text)
+			t := m.hsTurns[msg.Idx]
+			if strings.HasPrefix(msg.Text, translator.StreamErrPrefix) {
+				t.errMsg = strings.TrimPrefix(msg.Text, translator.StreamErrPrefix)
+			} else {
+				t.translation.WriteString(msg.Text)
+			}
 		}
 		return m, waitForHSChunk(msg.Idx, msg.Gen, m.hsCh)
 
@@ -693,7 +722,11 @@ func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
 			t.translating = false
 			t.done = true
 			m.hsCache[t.label] = t.translationStr()
-			m.debugLog = append(m.debugLog, dbgf("SESSIONS summary #%d done (%d chars)", msg.Idx+1, len(t.translationStr())))
+			if t.errMsg != "" {
+				m.debugLog = append(m.debugLog, dbgf("SESSIONS summary #%d API error: %s", msg.Idx+1, t.errMsg))
+			} else {
+				m.debugLog = append(m.debugLog, dbgf("SESSIONS summary #%d done (%d chars)", msg.Idx+1, len(t.translationStr())))
+			}
 		}
 
 	// History: All tab
@@ -719,7 +752,11 @@ func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
 
 	case HAChunkMsg:
 		if m.haEntry != nil {
-			m.haEntry.translation.WriteString(msg.Text)
+			if strings.HasPrefix(msg.Text, translator.StreamErrPrefix) {
+				m.haEntry.errMsg = strings.TrimPrefix(msg.Text, translator.StreamErrPrefix)
+			} else {
+				m.haEntry.translation.WriteString(msg.Text)
+			}
 		}
 		return m, waitForHAChunk(m.haCh)
 
@@ -727,7 +764,11 @@ func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
 		if m.haEntry != nil {
 			m.haEntry.translating = false
 			m.haEntry.done = true
-			m.debugLog = append(m.debugLog, dbgf("ALL-SESSIONS summary done (%d chars)", len(m.haEntry.translationStr())))
+			if m.haEntry.errMsg != "" {
+				m.debugLog = append(m.debugLog, dbgf("ALL-SESSIONS API error: %s", m.haEntry.errMsg))
+			} else {
+				m.debugLog = append(m.debugLog, dbgf("ALL-SESSIONS summary done (%d chars)", len(m.haEntry.translationStr())))
+			}
 		}
 
 	case LangChangedMsg:
@@ -1087,11 +1128,26 @@ func (m ViewerModel) buildTSLines(w int) []string {
 		if m.teeFilePath != "" {
 			teePathDisplay = m.teeFilePath
 		}
-		return []string{
+		lines := []string{
 			"",
 			WarnStyle.Render("  Live Stream: PTY master not accessible in this environment."),
 			"",
-			MutedStyle.Render("  To enable live streaming, run copilot through the tee wrapper:"),
+		}
+		// tmux option (shown first, if available)
+		if m.hasTmux {
+			lines = append(lines,
+				ActiveStyle.Render("  Option 1 — tmux (recommended, non-destructive):"),
+				TextStyle.Render("    tmux pipe-pane -o 'cat >> "+teePathDisplay+"'"),
+				MutedStyle.Render("    (Run this in any tmux window where copilot is running)"),
+				"",
+				MutedStyle.Render("  Option 2 — tee wrapper:"),
+			)
+		} else {
+			lines = append(lines,
+				MutedStyle.Render("  Option 1 — tee wrapper:"),
+			)
+		}
+		lines = append(lines,
 			TextStyle.Render(fmt.Sprintf("    copilot [args] 2>&1 | tee %s", teePathDisplay)),
 			"",
 			MutedStyle.Render("  Or add a shell alias:"),
@@ -1099,7 +1155,8 @@ func (m ViewerModel) buildTSLines(w int) []string {
 			"",
 			MutedStyle.Render(fmt.Sprintf("  Waiting for %s to appear...", teePathDisplay)),
 			"",
-		}
+		)
+		return lines
 	}
 	if len(m.tsTurns) == 0 {
 		return []string{
@@ -1249,6 +1306,14 @@ func buildHistoryBlock(t *viewTurn, w int, spinTick int) []string {
 // buildTranslationLines renders the translation content (or status) for a turn.
 func buildTranslationLines(t *viewTurn, textMaxW int, spinTick int) []string {
 	var lines []string
+
+	// Show API error state prominently.
+	if t.errMsg != "" {
+		lines = append(lines, ErrorStyle.Render("  ✗ API Error: "+t.errMsg))
+		lines = append(lines, MutedStyle.Render("  (The Copilot API returned an error for this turn.)"))
+		return lines
+	}
+
 	trans := t.translationStr()
 	if trans == "" {
 		if t.translating {

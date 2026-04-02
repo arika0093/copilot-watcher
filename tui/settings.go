@@ -233,17 +233,12 @@ func (m SettingsModel) View() string {
 }
 
 func (m SettingsModel) buildLangPanel(panelW int) string {
-	available := panelW - 6
-	if available < 4 {
-		available = 4
-	}
 	sectionActive := m.activeSection == 0
 	title := " Language "
 	if sectionActive {
 		title = " Language ● "
 	}
 	var rows []string
-	rows = append(rows, DimStyle.Render("  "+strings.Repeat("─", available)))
 	rows = append(rows, "")
 
 	for i, opt := range languages {
@@ -285,17 +280,12 @@ func (m SettingsModel) buildLangPanel(panelW int) string {
 }
 
 func (m SettingsModel) buildFmtPanel(panelW int) string {
-	available := panelW - 6
-	if available < 4 {
-		available = 4
-	}
 	sectionActive := m.activeSection == 1
 	title := " Output Format "
 	if sectionActive {
 		title = " Output Format ● "
 	}
 	var rows []string
-	rows = append(rows, DimStyle.Render("  "+strings.Repeat("─", available)))
 	rows = append(rows, "")
 
 	for i, opt := range formats {

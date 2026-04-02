@@ -7,10 +7,10 @@ import (
 
 // RTSystemPrompt is the system message for the real-time translation session.
 func RTSystemPrompt() string {
-	return `You are an expert at summarizing GitHub Copilot AI internal reasoning in real time.
-You receive the AI's thinking text one turn at a time.
-Respond ONLY with a concise summary in the language and format specified in the user message.
-Be informative but brief. No preamble. No meta-commentary. Output only the summary.`
+	return `You are an expert translator for GitHub Copilot AI internal reasoning text.
+You receive the AI's thinking/reasoning text one turn at a time.
+Translate the text faithfully and directly into the language and format specified in the user message.
+Preserve the original meaning. Do not summarize or add commentary. No preamble. Output only the translation.`
 }
 
 // HistSystemPrompt is the system message for the history summary session.
@@ -39,9 +39,9 @@ func FormatInstruction(format string) string {
 	}
 }
 
-// TranslateUserPrompt builds the user message for a real-time turn summary.
+// TranslateUserPrompt builds the user message for a real-time turn translation.
 func TranslateUserPrompt(reasoningText, lang, format string) string {
-	return fmt.Sprintf("Language: %s\nFormat: %s\n\n%s",
+	return fmt.Sprintf("Language: %s\nFormat: %s\nTask: Translate the following reasoning text directly into the target language. Do not summarize.\n\n%s",
 		lang, FormatInstruction(format), reasoningText)
 }
 

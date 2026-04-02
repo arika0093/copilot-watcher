@@ -11,6 +11,11 @@ import (
 	"github.com/fsnotify/fsnotify"
 )
 
+// debounceDuration is how long the watcher waits for file writes to settle
+// before processing new lines. This prevents partial-line reads when
+// events.jsonl is written incrementally.
+const debounceDuration = 300 * time.Millisecond
+
 // ReasoningMsg carries a new reasoning text detected from events.jsonl
 type ReasoningMsg struct {
 	SessionID     string
@@ -91,12 +96,58 @@ func (w *Watcher) readLoop(f *os.File, fw *fsnotify.Watcher) {
 	defer fw.Close()
 
 	reader := bufio.NewReader(f)
+	var partial []byte // incomplete line buffered across reads
 	var pendingUser string
 	lineCount := 0
+
+	// flushCh is signalled by the debounce timer to process pending file data.
+	flushCh := make(chan struct{}, 1)
+	var debounceTimer *time.Timer
+
+	resetDebounce := func() {
+		if debounceTimer != nil {
+			debounceTimer.Stop()
+		}
+		debounceTimer = time.AfterFunc(debounceDuration, func() {
+			select {
+			case flushCh <- struct{}{}:
+			default:
+			}
+		})
+	}
+
+	flush := func() {
+		linesRead := 0
+		for {
+			chunk, err := reader.ReadBytes('\n')
+			// Prepend any previously buffered partial data.
+			if len(partial) > 0 {
+				chunk = append(partial, chunk...)
+				partial = nil
+			}
+			if len(chunk) == 0 {
+				break
+			}
+			if err == io.EOF {
+				// Incomplete line — buffer it and wait for more data.
+				partial = append([]byte(nil), chunk...)
+				break
+			}
+			linesRead++
+			lineCount++
+			w.processLine(chunk, &pendingUser)
+		}
+		if linesRead > 0 {
+			w.sendDbg(fmt.Sprintf("events.jsonl flushed: +%d line(s) (total %d)", linesRead, lineCount))
+		}
+	}
 
 	for {
 		select {
 		case <-w.done:
+			if debounceTimer != nil {
+				debounceTimer.Stop()
+			}
 			return
 		case evt, ok := <-fw.Events:
 			if !ok {
@@ -105,23 +156,9 @@ func (w *Watcher) readLoop(f *os.File, fw *fsnotify.Watcher) {
 			if evt.Op&(fsnotify.Write|fsnotify.Create) == 0 {
 				continue
 			}
-			// Read all newly appended lines
-			linesRead := 0
-			for {
-				line, err := reader.ReadBytes('\n')
-				if len(line) == 0 {
-					break
-				}
-				linesRead++
-				lineCount++
-				w.processLine(line, &pendingUser)
-				if err == io.EOF {
-					break
-				}
-			}
-			if linesRead > 0 {
-				w.sendDbg(fmt.Sprintf("events.jsonl updated: +%d line(s) (total %d)", linesRead, lineCount))
-			}
+			resetDebounce()
+		case <-flushCh:
+			flush()
 		case err, ok := <-fw.Errors:
 			if !ok || err == nil {
 				continue

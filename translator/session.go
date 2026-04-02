@@ -129,6 +129,11 @@ func (t *Translator) Close() {
 	}
 }
 
+// StreamErrPrefix is a sentinel prefix written to the stream channel when a
+// session-level error occurs. Consumers should check for this prefix and handle
+// it as an error rather than appending it to the translation output.
+const StreamErrPrefix = "\x01STREAM_ERROR:"
+
 // stream sends a user prompt to a session and streams response chunks.
 func (t *Translator) stream(ctx context.Context, sess *copilot.Session, sessionID, userPrompt string) (<-chan string, error) {
 	t.log(fmt.Sprintf("Copilot SDK: stream started for session %s", sessionID))
@@ -158,8 +163,13 @@ func (t *Translator) stream(ctx context.Context, sess *copilot.Session, sessionI
 			}
 		case copilot.SessionEventTypeSessionError:
 			if evt.Data.Message != nil {
-				t.log(fmt.Sprintf("Copilot SDK: session error in %s: %s", sessionID, *evt.Data.Message))
-				ch <- fmt.Sprintf("[Error: %s]", *evt.Data.Message)
+				errMsg := *evt.Data.Message
+				t.log(fmt.Sprintf("Copilot SDK: session error in %s: %s", sessionID, errMsg))
+				// Send tagged error sentinel instead of mixing with translation text.
+				select {
+				case ch <- StreamErrPrefix + errMsg:
+				default:
+				}
 			}
 			select {
 			case <-done:
