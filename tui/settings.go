@@ -40,10 +40,10 @@ type fmtOption struct {
 }
 
 var formats = []fmtOption{
-	{"bullets", "Bullet List", "- key points (default)"},
-	{"numbered", "Numbered List", "1. 2. 3. style"},
-	{"prose", "Prose", "Flowing paragraphs"},
-	{"", "Custom…", "Type your own instruction"},
+	{"bullets", "Bullet summary", "- key points (default)"},
+	{"translate-only", "Translation only", "faithful, no summarizing"},
+	{"conversational", "Conversational", "casual style"},
+	{"", "Custom…", "type your own instruction"},
 }
 
 // SettingsModel is the language/output settings screen.
@@ -225,9 +225,9 @@ func (m SettingsModel) View() string {
 		MutedStyle.Render("Format:"), ActiveStyle.Render(fmtLabel(m.currentFormat)),
 	))
 	if m.inputMode {
-		sb.WriteString(HelpStyle.Render("  [enter] confirm   [esc] cancel"))
+		sb.WriteString(HelpStyle.Render("  [enter] confirm   [esc] cancel input"))
 	} else {
-		sb.WriteString(HelpStyle.Render("  [↑↓/kj] navigate   [tab/l/h] switch section   [enter] select   [esc/s] close"))
+		sb.WriteString(HelpStyle.Render("  [↑↓/kj] navigate   [tab/l/h] switch section   [enter] select   [q] close"))
 	}
 	return sb.String()
 }
@@ -354,7 +354,7 @@ func fmtLabel(code string) string {
 		}
 	}
 	if code == "" {
-		return "Bullet List"
+		return "Bullet summary"
 	}
 	return trimStr(code, 20)
 }

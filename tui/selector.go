@@ -145,6 +145,10 @@ func (m SelectorModel) View() string {
 		body.WriteString("\n")
 		body.WriteString(MutedStyle.Render("  Make sure a Copilot CLI session is running, then press [r] to refresh."))
 		body.WriteString("\n")
+		body.WriteString(MutedStyle.Render("  ℹ Sessions are only visible after the first message is sent in Copilot CLI."))
+		body.WriteString("\n")
+		body.WriteString(MutedStyle.Render("    If Copilot CLI is open but no conversation has started, nothing will appear here."))
+		body.WriteString("\n")
 	} else {
 		// Column headers
 		hdr := fmt.Sprintf("  %-8s  %-36s  %-8s  %-10s  %s",

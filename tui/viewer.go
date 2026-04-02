@@ -49,11 +49,9 @@ type tsDebounceMsg struct{ seq int }
 
 // History: Sessions tab
 type HSLoadedMsg struct {
-	Entries []hsEntry
-	Err     error
+	Turns []session.Turn
+	Err   error
 }
-
-type hsNavDebounceMsg struct{ seq int }
 
 // teeCheckMsg fires periodically to detect a newly-appeared tee stream file.
 type teeCheckMsg struct{}
@@ -67,8 +65,6 @@ type HSDoneMsg struct {
 	Idx int
 	Gen int
 }
-
-// History: All tab
 type HALoadedMsg struct {
 	Reasoning string
 	Err       error
@@ -94,11 +90,6 @@ type BackToListMsg struct{}
 
 // WatcherDebugMsg carries debug messages from the JSONL file watcher.
 type WatcherDebugMsg struct{ Text string }
-
-type hsEntry struct {
-	Info      session.SessionInfo
-	Reasoning string
-}
 
 // ── viewTurn: single thought + translation unit ────────────────────────────────
 
@@ -138,14 +129,12 @@ type ViewerModel struct {
 	tsCh     <-chan string
 	tsCancel context.CancelFunc
 
-	// History: Sessions tab
+	// History: Turns tab (per-request of the current session)
 	hsTurns      []*viewTurn
-	hsCursor     int // current session index (0=newest)
-	hsGeneration int // incremented on each new translation to discard stale msgs
+	hsQ          []int // translation queue (indices), newest first
+	hsGeneration int   // incremented per new translation to discard stale msgs
 	hsCh         <-chan string
 	hsCancel     context.CancelFunc
-	hsCache      map[string]string // sessionID → completed translation cache
-	hsNavSeq     int
 
 	// History: All tab
 	haEntry  *viewTurn
@@ -168,7 +157,7 @@ type ViewerModel struct {
 	spinnerTick int
 
 	startTime   time.Time // when the viewer was created (used for tee-file freshness check)
-	teeFilePath string    // resolved path to ~/.copilot-watcher-stream
+	teeFilePath string    // path to /tmp/copilot-watcher-stream
 	hasTmux     bool      // true if tmux is available on PATH
 
 	watcher    *session.Watcher
@@ -176,10 +165,7 @@ type ViewerModel struct {
 }
 
 func NewViewerModel(info session.SessionInfo, trans *translator.Translator, allSessions []session.SessionInfo) ViewerModel {
-	teeFilePath := ""
-	if home, err := os.UserHomeDir(); err == nil {
-		teeFilePath = home + "/.copilot-watcher-stream"
-	}
+	teeFilePath := "/tmp/copilot-watcher-stream"
 	_, hasTmux := exec.LookPath("tmux")
 	return ViewerModel{
 		info:         info,
@@ -187,7 +173,6 @@ func NewViewerModel(info session.SessionInfo, trans *translator.Translator, allS
 		allSessions:  allSessions,
 		activeTab:    TabRealtime,
 		scroll:       map[TabID]int{},
-		hsCache:      map[string]string{},
 		status:       "Initializing...",
 		statusOK:     false,
 		outputLang:   trans.GetLanguage(),
@@ -218,35 +203,14 @@ func loadHistoryCmd(path string) tea.Cmd {
 	}
 }
 
-func loadHistorySessionsCmd(allSessions []session.SessionInfo) tea.Cmd {
+// loadHistorySessionsCmd loads individual turns from the current session only.
+func loadHistorySessionsCmd(eventsPath string) tea.Cmd {
 	return func() tea.Msg {
-		// Always reload all sessions for history tabs
-		all, err := session.LoadAllSessions()
+		turns, err := session.LoadHistory(eventsPath)
 		if err != nil {
 			return HSLoadedMsg{Err: err}
 		}
-		if len(all) == 0 {
-			all = allSessions
-		}
-		var entries []hsEntry
-		for _, s := range all {
-			turns, err := session.LoadHistory(s.EventsPath)
-			if err != nil || len(turns) == 0 {
-				continue
-			}
-			var sb strings.Builder
-			for _, t := range turns {
-				if t.ReasoningText != "" {
-					sb.WriteString(t.ReasoningText)
-					sb.WriteString("\n---\n")
-				}
-			}
-			if sb.Len() == 0 {
-				continue
-			}
-			entries = append(entries, hsEntry{Info: s, Reasoning: sb.String()})
-		}
-		return HSLoadedMsg{Entries: entries}
+		return HSLoadedMsg{Turns: turns}
 	}
 }
 
@@ -355,9 +319,6 @@ func tsDebounceCmd(seq int) tea.Cmd {
 	return tea.Tick(2*time.Second, func(_ time.Time) tea.Msg { return tsDebounceMsg{seq: seq} })
 }
 
-func hsNavDebounceCmd(seq int) tea.Cmd {
-	return tea.Tick(200*time.Millisecond, func(_ time.Time) tea.Msg { return hsNavDebounceMsg{seq: seq} })
-}
 
 func teeCheckCmd() tea.Cmd {
 	return tea.Tick(2*time.Second, func(_ time.Time) tea.Msg { return teeCheckMsg{} })
@@ -404,40 +365,37 @@ func (m *ViewerModel) startNextRT() tea.Cmd {
 	return nil
 }
 
-// startHSForCursor starts translation for the session at hsCursor.
-// Cancels any in-progress translation, resets the turn, and starts fresh.
-func (m *ViewerModel) startHSForCursor() tea.Cmd {
-	if m.hsCursor >= len(m.hsTurns) {
-		return nil
+// startNextHS translates the next queued turn in the History/Turns tab.
+// Uses the histSession (independent from the RT session) for per-turn translation.
+func (m *ViewerModel) startNextHS() tea.Cmd {
+	for len(m.hsQ) > 0 {
+		idx := m.hsQ[0]
+		m.hsQ = m.hsQ[1:]
+		if idx >= len(m.hsTurns) {
+			continue
+		}
+		t := m.hsTurns[idx]
+		if t.done || t.translating || t.reasoning == "" {
+			continue
+		}
+		if m.hsCancel != nil {
+			m.hsCancel()
+		}
+		m.hsGeneration++
+		gen := m.hsGeneration
+		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+		m.hsCancel = cancel
+		ch, err := m.trans.TranslateTurn(ctx, t.reasoning)
+		if err != nil {
+			t.translation.WriteString(fmt.Sprintf("Translation error: %v", err))
+			t.done = true
+			return m.startNextHS()
+		}
+		t.translating = true
+		m.hsCh = ch
+		return tea.Batch(waitForHSChunk(idx, gen, ch), spinnerCmd())
 	}
-	t := m.hsTurns[m.hsCursor]
-	if t.done {
-		return nil // already fully translated; show cached result
-	}
-	// Cancel any in-flight translation
-	if m.hsCancel != nil {
-		m.hsCancel()
-		m.hsCancel = nil
-	}
-	// Reset partial state for this turn
-	t.translating = false
-	t.translation.Reset()
-	if t.reasoning == "" {
-		return nil
-	}
-	m.hsGeneration++ // invalidate any stale chunk messages
-	gen := m.hsGeneration
-	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
-	m.hsCancel = cancel
-	ch, err := m.trans.SummarizeSession(ctx, t.label, t.reasoning)
-	if err != nil {
-		t.translation.WriteString(fmt.Sprintf("エラー: %v", err))
-		t.done = true
-		return nil
-	}
-	t.translating = true
-	m.hsCh = ch
-	return tea.Batch(waitForHSChunk(m.hsCursor, gen, ch), spinnerCmd())
+	return nil
 }
 
 func (m *ViewerModel) startHA() tea.Cmd {
@@ -451,7 +409,7 @@ func (m *ViewerModel) startHA() tea.Cmd {
 	m.haCancel = cancel
 	ch, err := m.trans.SummarizeAll(ctx, m.haEntry.reasoning)
 	if err != nil {
-		m.haEntry.translation.WriteString(fmt.Sprintf("エラー: %v", err))
+		m.haEntry.translation.WriteString(fmt.Sprintf("Translation error: %v", err))
 		m.haEntry.done = true
 		return nil
 	}
@@ -516,8 +474,13 @@ func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
 				}
 			}
 		}
-		if !anyActive && m.hsCursor < len(m.hsTurns) && m.hsTurns[m.hsCursor].translating {
-			anyActive = true
+		if !anyActive {
+			for _, t := range m.hsTurns {
+				if t.translating {
+					anyActive = true
+					break
+				}
+			}
 		}
 		if !anyActive && m.haEntry != nil && m.haEntry.translating {
 			anyActive = true
@@ -565,9 +528,34 @@ func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
 			n = 0
 		}
 		m.debugLog = append(m.debugLog, dbgf("HISTORY loaded %d turns from events.jsonl", n))
-		return m, func() tea.Msg {
-			return InitStepMsg{Step: fmt.Sprintf("Session has %d history turns (tabs [3]/[4] to view)", n), OK: true}
+		// Populate History/Turns tab with historical turns (newest first in queue)
+		if msg.Err == nil && len(msg.Turns) > 0 {
+			m.hsTurns = nil
+			m.hsQ = nil
+			for i, t := range msg.Turns {
+				vt := &viewTurn{
+					turnNum:   i + 1,
+					userMsg:   t.UserMessage,
+					reasoning: t.ReasoningText,
+					timestamp: t.Timestamp,
+				}
+				m.hsTurns = append(m.hsTurns, vt)
+			}
+			// Queue newest first
+			for i := len(m.hsTurns) - 1; i >= 0; i-- {
+				if m.hsTurns[i].reasoning != "" {
+					m.hsQ = append(m.hsQ, i)
+				}
+			}
 		}
+		var cmds []tea.Cmd
+		cmds = append(cmds, func() tea.Msg {
+			return InitStepMsg{Step: fmt.Sprintf("Session has %d history turns (tabs [3]/[4] to view)", n), OK: true}
+		})
+		if m.trans != nil {
+			cmds = append(cmds, m.startNextHS())
+		}
+		return m, tea.Batch(cmds...)
 
 	case ReasoningDetectedMsg:
 		vt := &viewTurn{
@@ -580,11 +568,24 @@ func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
 		idx := len(m.rtTurns) - 1
 		m.rtQ = append([]int{idx}, m.rtQ...) // live turn: priority
 		m.debugLog = append(m.debugLog, dbgf("RT turn #%d detected (%d chars), queuing translation", idx+1, len(msg.ReasoningText)))
+
+		// Also add to History/Turns tab so all session turns are visible there
+		hsVt := &viewTurn{
+			turnNum:   len(m.hsTurns) + 1,
+			userMsg:   msg.UserMessage,
+			reasoning: msg.ReasoningText,
+			timestamp: msg.Timestamp,
+		}
+		m.hsTurns = append(m.hsTurns, hsVt)
+		hsIdx := len(m.hsTurns) - 1
+		m.hsQ = append([]int{hsIdx}, m.hsQ...) // priority: newest first
+
 		var cmds []tea.Cmd
 		if m.watcher != nil {
 			cmds = append(cmds, waitForReasoning(m.watcher.Chan()))
 		}
 		cmds = append(cmds, m.startNextRT())
+		cmds = append(cmds, m.startNextHS())
 		return m, tea.Batch(cmds...)
 
 	case RTChunkMsg:
@@ -654,48 +655,36 @@ func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
 			}
 		}
 
-	// History: Sessions tab
+	// History: Turns tab
 	case HSLoadedMsg:
-		// Preserve completed translations from cache
-		prevCache := map[string]string{}
-		for _, t := range m.hsTurns {
-			if t.done && t.label != "" {
-				prevCache[t.label] = t.translationStr()
-			}
-		}
-		for k, v := range prevCache {
-			m.hsCache[k] = v
-		}
-
 		m.hsTurns = nil
+		m.hsQ = nil
 		if msg.Err != nil {
-			vt := &viewTurn{turnNum: 1, label: "Error", reasoning: msg.Err.Error()}
-			vt.translation.WriteString(fmt.Sprintf("Session load error: %v", msg.Err))
+			vt := &viewTurn{turnNum: 1, reasoning: msg.Err.Error()}
+			vt.translation.WriteString(fmt.Sprintf("Load error: %v", msg.Err))
 			vt.done = true
 			m.hsTurns = []*viewTurn{vt}
-			m.debugLog = append(m.debugLog, dbgf("SESSIONS load error: %v", msg.Err))
+			m.debugLog = append(m.debugLog, dbgf("HISTORY TURNS load error: %v", msg.Err))
 		} else {
-			cached := 0
-			for i, entry := range msg.Entries {
-				label := entry.Info.SessionID[:8] + "  " + entry.Info.Cwd
+			for i, t := range msg.Turns {
 				vt := &viewTurn{
 					turnNum:   i + 1,
-					label:     label,
-					reasoning: entry.Reasoning,
-					timestamp: entry.Info.UpdatedAt,
-				}
-				if c, ok := m.hsCache[label]; ok {
-					vt.translation.WriteString(c)
-					vt.done = true
-					cached++
+					userMsg:   t.UserMessage,
+					reasoning: t.ReasoningText,
+					timestamp: t.Timestamp,
 				}
 				m.hsTurns = append(m.hsTurns, vt)
 			}
-			m.debugLog = append(m.debugLog, dbgf("SESSIONS loaded %d sessions (%d from cache)", len(msg.Entries), cached))
+			// Queue newest first
+			for i := len(m.hsTurns) - 1; i >= 0; i-- {
+				if m.hsTurns[i].reasoning != "" {
+					m.hsQ = append(m.hsQ, i)
+				}
+			}
+			m.debugLog = append(m.debugLog, dbgf("HISTORY TURNS loaded %d turns", len(msg.Turns)))
 		}
-		m.hsCursor = 0
 		if m.trans != nil {
-			return m, m.startHSForCursor()
+			return m, m.startNextHS()
 		}
 		return m, nil
 
@@ -721,13 +710,14 @@ func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
 			t := m.hsTurns[msg.Idx]
 			t.translating = false
 			t.done = true
-			m.hsCache[t.label] = t.translationStr()
 			if t.errMsg != "" {
-				m.debugLog = append(m.debugLog, dbgf("SESSIONS summary #%d API error: %s", msg.Idx+1, t.errMsg))
+				m.debugLog = append(m.debugLog, dbgf("HISTORY TURNS #%d API error: %s", msg.Idx+1, t.errMsg))
 			} else {
-				m.debugLog = append(m.debugLog, dbgf("SESSIONS summary #%d done (%d chars)", msg.Idx+1, len(t.translationStr())))
+				m.debugLog = append(m.debugLog, dbgf("HISTORY TURNS #%d done (%d chars)", msg.Idx+1, len(t.translationStr())))
 			}
 		}
+		return m, m.startNextHS()
+
 
 	// History: All tab
 	case HALoadedMsg:
@@ -782,11 +772,6 @@ func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
 	case SDKLogMsg:
 		m.debugLog = append(m.debugLog, dbgf("SDK %s", msg.Text))
 
-	case hsNavDebounceMsg:
-		if msg.seq == m.hsNavSeq {
-			return m, m.startHSForCursor()
-		}
-
 	case teeCheckMsg:
 		if m.termReader == nil && m.teeFilePath != "" {
 			info, err := os.Stat(m.teeFilePath)
@@ -805,35 +790,19 @@ func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
 	case tea.MouseMsg:
 		switch msg.Button {
 		case tea.MouseButtonWheelUp:
-			if m.activeTab == TabHistorySessions {
-				if m.hsCursor > 0 {
-					m.hsCursor--
-					m.hsNavSeq++
-					seq := m.hsNavSeq
-					return m, hsNavDebounceCmd(seq)
-				}
-			} else {
-				if m.scroll[m.activeTab] > 0 {
-					m.scroll[m.activeTab]--
-				}
+			if m.scroll[m.activeTab] > 0 {
+				m.scroll[m.activeTab]--
 			}
 		case tea.MouseButtonWheelDown:
-			if m.activeTab == TabHistorySessions {
-				if m.hsCursor < len(m.hsTurns)-1 {
-					m.hsCursor++
-					m.hsNavSeq++
-					seq := m.hsNavSeq
-					return m, hsNavDebounceCmd(seq)
-				}
-			} else {
-				m.scroll[m.activeTab]++
-			}
+			m.scroll[m.activeTab]++
 		}
 
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "esc", "b":
 			return m, func() tea.Msg { return BackToListMsg{} }
+		case "y":
+			return m, m.saveCurrentTabCmd()
 		case "1":
 			m.activeTab = TabRealtime
 			m.debugLog = append(m.debugLog, dbgf("TAB switched to Real-time"))
@@ -841,18 +810,8 @@ func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
 			m.activeTab = TabLiveStream
 			m.debugLog = append(m.debugLog, dbgf("TAB switched to Live Stream"))
 		case "3":
-			// Always reload sessions when switching to this tab; cancel any pending nav
 			m.activeTab = TabHistorySessions
-			if m.hsCancel != nil {
-				m.hsCancel()
-				m.hsCancel = nil
-			}
-			m.hsNavSeq++
-			m.debugLog = append(m.debugLog, dbgf("TAB switched to History: Sessions → reloading"))
-			return m, tea.Batch(
-				func() tea.Msg { return InitStepMsg{Step: "Refreshing session history...", OK: true} },
-				loadHistorySessionsCmd(m.allSessions),
-			)
+			m.debugLog = append(m.debugLog, dbgf("TAB switched to History: Turns"))
 		case "4":
 			// Always reload all-sessions summary when switching to this tab
 			m.activeTab = TabHistoryAll
@@ -869,29 +828,11 @@ func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
 		case "5":
 			m.activeTab = TabDebug
 		case "up", "k":
-			if m.activeTab == TabHistorySessions {
-				if m.hsCursor > 0 {
-					m.hsCursor--
-					m.hsNavSeq++
-					seq := m.hsNavSeq
-					return m, hsNavDebounceCmd(seq)
-				}
-			} else {
-				if m.scroll[m.activeTab] > 0 {
-					m.scroll[m.activeTab]--
-				}
+			if m.scroll[m.activeTab] > 0 {
+				m.scroll[m.activeTab]--
 			}
 		case "down", "j":
-			if m.activeTab == TabHistorySessions {
-				if m.hsCursor < len(m.hsTurns)-1 {
-					m.hsCursor++
-					m.hsNavSeq++
-					seq := m.hsNavSeq
-					return m, hsNavDebounceCmd(seq)
-				}
-			} else {
-				m.scroll[m.activeTab]++
-			}
+			m.scroll[m.activeTab]++
 		case "G":
 			m.scroll[m.activeTab] = 999999
 		case "g":
@@ -1007,7 +948,7 @@ func (m ViewerModel) View() string {
 		scrollInfo = fmt.Sprintf("   [%d/%d lines]", offset+1, len(allLines))
 	}
 	help := HelpStyle.Render(fmt.Sprintf(
-		"  [esc/b] back   [1-5] tab   [↑↓/kj] scroll   [g/G] top/bottom   [q] quit%s",
+		"  [esc/b] back   [1-5] tab   [↑↓/kj] scroll   [g/G] top/bottom   [y] save   [q] quit%s",
 		scrollInfo,
 	))
 	sb.WriteString(help)
@@ -1022,7 +963,7 @@ func (m ViewerModel) renderTabBar(w int) string {
 	tabs := []tabDef{
 		{TabRealtime, "[1] Real-time"},
 		{TabLiveStream, "[2] Live Stream"},
-		{TabHistorySessions, "[3] History: Sessions"},
+		{TabHistorySessions, "[3] History: Turns"},
 		{TabHistoryAll, "[4] History: All"},
 		{TabDebug, "[5] Debug"},
 	}
@@ -1070,9 +1011,16 @@ func (m ViewerModel) buildPanelTitle() string {
 			title += " " + MutedStyle.Render(fmt.Sprintf(" [buffering %d bytes…]", m.tsBuffer.Len()))
 		}
 	case TabHistorySessions:
-		title = " History: Sessions"
-		if m.hsCursor < len(m.hsTurns) && m.hsTurns[m.hsCursor].translating {
-			title += " " + WarnStyle.Render(SpinnerFrames[m.spinnerTick]+" summarizing")
+		title = " History: Turns"
+		anyTranslating := false
+		for _, t := range m.hsTurns {
+			if t.translating {
+				anyTranslating = true
+				break
+			}
+		}
+		if anyTranslating {
+			title += " " + WarnStyle.Render(SpinnerFrames[m.spinnerTick]+" translating")
 		}
 	case TabHistoryAll:
 		title = " History: All Sessions"
@@ -1124,7 +1072,7 @@ func (m ViewerModel) buildRTLines(w int) []string {
 
 func (m ViewerModel) buildTSLines(w int) []string {
 	if m.termReader == nil {
-		teePathDisplay := "~/.copilot-watcher-stream"
+		teePathDisplay := "/tmp/copilot-watcher-stream"
 		if m.teeFilePath != "" {
 			teePathDisplay = m.teeFilePath
 		}
@@ -1138,20 +1086,23 @@ func (m ViewerModel) buildTSLines(w int) []string {
 			lines = append(lines,
 				ActiveStyle.Render("  Option 1 — tmux (recommended, non-destructive):"),
 				TextStyle.Render("    tmux pipe-pane -o 'cat >> "+teePathDisplay+"'"),
-				MutedStyle.Render("    (Run this in any tmux window where copilot is running)"),
+				MutedStyle.Render("    (Run in any tmux window where copilot is running)"),
 				"",
-				MutedStyle.Render("  Option 2 — tee wrapper:"),
+				MutedStyle.Render("  Option 2 — script (records in a new shell session):"),
 			)
 		} else {
 			lines = append(lines,
-				MutedStyle.Render("  Option 1 — tee wrapper:"),
+				MutedStyle.Render("  Option 1 — script (records in a new shell session):"),
 			)
 		}
 		lines = append(lines,
-			TextStyle.Render(fmt.Sprintf("    copilot [args] 2>&1 | tee %s", teePathDisplay)),
+			MutedStyle.Render("    # Linux:"),
+			TextStyle.Render("    script -a -q -f "+teePathDisplay),
+			MutedStyle.Render("    # macOS:"),
+			TextStyle.Render("    script -a -q -F "+teePathDisplay),
+			MutedStyle.Render("    # Run copilot in the new shell that opens. Exit with Ctrl+D."),
 			"",
-			MutedStyle.Render("  Or add a shell alias:"),
-			TextStyle.Render(fmt.Sprintf("    alias copilot='copilot 2>&1 | tee %s'", teePathDisplay)),
+			WarnStyle.Render("  ⚠ Do NOT use 'copilot | tee ...' — it disables copilot's TUI interaction."),
 			"",
 			MutedStyle.Render(fmt.Sprintf("  Waiting for %s to appear...", teePathDisplay)),
 			"",
@@ -1178,30 +1129,16 @@ func (m ViewerModel) buildTSLines(w int) []string {
 
 func (m ViewerModel) buildHSLines(w int) []string {
 	if len(m.hsTurns) == 0 {
-		return []string{"", WarnStyle.Render("  Loading sessions..."), ""}
+		return []string{"", WarnStyle.Render("  No turns found for this session yet."), ""}
 	}
-	cur := m.hsCursor
-	if cur >= len(m.hsTurns) {
-		cur = len(m.hsTurns) - 1
+	var lines []string
+	// Newest first
+	for i := len(m.hsTurns) - 1; i >= 0; i-- {
+		if i < len(m.hsTurns)-1 {
+			lines = append(lines, MutedStyle.Render("  "+strings.Repeat("─", max(0, w-8))))
+		}
+		lines = append(lines, buildTurnBlock(m.hsTurns[i], w, m.spinnerTick)...)
 	}
-
-	// Navigation indicator bar
-	navParts := []string{fmt.Sprintf("  Session %d / %d", cur+1, len(m.hsTurns))}
-	if cur == 0 {
-		navParts = append(navParts, MutedStyle.Render("(newest)"))
-	} else if cur == len(m.hsTurns)-1 {
-		navParts = append(navParts, MutedStyle.Render("(oldest)"))
-	}
-	if cur > 0 {
-		navParts = append(navParts, ActiveStyle.Render("[↑] newer"))
-	}
-	if cur < len(m.hsTurns)-1 {
-		navParts = append(navParts, MutedStyle.Render("[↓] older"))
-	}
-	navLine := DimStyle.Render(strings.Join(navParts, "   "))
-
-	lines := []string{navLine, ""}
-	lines = append(lines, buildHistoryBlock(m.hsTurns[cur], w, m.spinnerTick)...)
 	return lines
 }
 
@@ -1423,15 +1360,60 @@ func dbgf(format string, args ...any) string {
 	return fmt.Sprintf("[%s] %s", time.Now().Format("15:04:05"), fmt.Sprintf(format, args...))
 }
 
+// saveCurrentTabCmd writes the current tab's translations to a /tmp file.
+func (m ViewerModel) saveCurrentTabCmd() tea.Cmd {
+	return func() tea.Msg {
+		var sb strings.Builder
+		switch m.activeTab {
+		case TabRealtime:
+			for i := len(m.rtTurns) - 1; i >= 0; i-- {
+				t := m.rtTurns[i]
+				if t.userMsg != "" {
+					sb.WriteString("Q: " + t.userMsg + "\n\n")
+				}
+				sb.WriteString(t.translationStr())
+				sb.WriteString("\n\n---\n\n")
+			}
+		case TabLiveStream:
+			for i := len(m.tsTurns) - 1; i >= 0; i-- {
+				sb.WriteString(m.tsTurns[i].translationStr())
+				sb.WriteString("\n\n---\n\n")
+			}
+		case TabHistorySessions:
+			for i := len(m.hsTurns) - 1; i >= 0; i-- {
+				t := m.hsTurns[i]
+				if t.userMsg != "" {
+					sb.WriteString("Q: " + t.userMsg + "\n\n")
+				}
+				sb.WriteString(t.translationStr())
+				sb.WriteString("\n\n---\n\n")
+			}
+		case TabHistoryAll:
+			if m.haEntry != nil {
+				sb.WriteString(m.haEntry.translationStr())
+			}
+		}
+		content := strings.TrimSpace(sb.String())
+		if content == "" {
+			return StatusMsg{Text: "No content to save", OK: false}
+		}
+		fname := fmt.Sprintf("/tmp/copilot-watcher-%s.txt", time.Now().Format("20060102-150405"))
+		if err := os.WriteFile(fname, []byte(content+"\n"), 0644); err != nil {
+			return StatusMsg{Text: "Save failed: " + err.Error(), OK: false}
+		}
+		return StatusMsg{Text: "Saved → " + fname, OK: true}
+	}
+}
+
 // fmtShort returns a short display string for an output format code.
 func fmtShort(format string) string {
 	switch format {
 	case "bullets":
 		return "bullets"
-	case "numbered":
-		return "numbered"
-	case "prose":
-		return "prose"
+	case "translate-only":
+		return "translate"
+	case "conversational":
+		return "casual"
 	default:
 		if format == "" {
 			return "bullets"

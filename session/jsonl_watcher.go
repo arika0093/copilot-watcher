@@ -98,6 +98,8 @@ func (w *Watcher) readLoop(f *os.File, fw *fsnotify.Watcher) {
 	reader := bufio.NewReader(f)
 	var partial []byte // incomplete line buffered across reads
 	var pendingUser string
+	var pendingReasoning string
+	var pendingTS time.Time
 	lineCount := 0
 
 	// flushCh is signalled by the debounce timer to process pending file data.
@@ -135,7 +137,7 @@ func (w *Watcher) readLoop(f *os.File, fw *fsnotify.Watcher) {
 			}
 			linesRead++
 			lineCount++
-			w.processLine(chunk, &pendingUser)
+			w.processLine(chunk, &pendingUser, &pendingReasoning, &pendingTS)
 		}
 		if linesRead > 0 {
 			w.sendDbg(fmt.Sprintf("events.jsonl flushed: +%d line(s) (total %d)", linesRead, lineCount))
@@ -168,7 +170,7 @@ func (w *Watcher) readLoop(f *os.File, fw *fsnotify.Watcher) {
 	}
 }
 
-func (w *Watcher) processLine(line []byte, pendingUser *string) {
+func (w *Watcher) processLine(line []byte, pendingUser *string, pendingReasoning *string, pendingTS *time.Time) {
 	var evt SessionEvent
 	if err := json.Unmarshal(line, &evt); err != nil {
 		return
@@ -178,6 +180,8 @@ func (w *Watcher) processLine(line []byte, pendingUser *string) {
 		d, err := ParseUserMessage(evt)
 		if err == nil {
 			*pendingUser = d.Content
+			*pendingReasoning = ""
+			*pendingTS = evt.Timestamp
 			w.sendDbg(fmt.Sprintf("user.message: %d chars", len(d.Content)))
 		}
 	case "assistant.message":
@@ -185,30 +189,33 @@ func (w *Watcher) processLine(line []byte, pendingUser *string) {
 		if err != nil {
 			return
 		}
-		// Use reasoningText if present; fall back to content (response text)
-		text := d.ReasoningText
-		isReasoning := text != ""
-		if text == "" {
-			text = d.Content
-		}
-		if text == "" {
-			return
-		}
-		kind := "content"
-		if isReasoning {
-			kind = "reasoningText"
-		}
-		w.sendDbg(fmt.Sprintf("assistant.message (%s): %d chars → queuing translation", kind, len(text)))
-		select {
-		case w.ch <- ReasoningMsg{
-			SessionID:     w.sessionID,
-			UserMessage:   *pendingUser,
-			ReasoningText: text,
-			Timestamp:     evt.Timestamp,
-		}:
-		default:
+		// Accumulate reasoning text (prefer reasoningText, fall back to content)
+		if d.ReasoningText != "" {
+			*pendingReasoning += d.ReasoningText
+			w.sendDbg(fmt.Sprintf("assistant.message (reasoningText): %d chars accumulated", len(*pendingReasoning)))
+		} else if d.Content != "" {
+			*pendingReasoning += d.Content
+			w.sendDbg(fmt.Sprintf("assistant.message (content): %d chars accumulated", len(*pendingReasoning)))
 		}
 	case "assistant.turn_end":
 		w.sendDbg("assistant.turn_end received")
+		// Emit the full accumulated turn only now that it is complete
+		if *pendingUser != "" && *pendingReasoning != "" {
+			ts := *pendingTS
+			if ts.IsZero() {
+				ts = time.Now()
+			}
+			select {
+			case w.ch <- ReasoningMsg{
+				SessionID:     w.sessionID,
+				UserMessage:   *pendingUser,
+				ReasoningText: *pendingReasoning,
+				Timestamp:     ts,
+			}:
+				w.sendDbg(fmt.Sprintf("turn emitted (%d chars) → queuing translation", len(*pendingReasoning)))
+			default:
+			}
+			*pendingReasoning = ""
+		}
 	}
 }

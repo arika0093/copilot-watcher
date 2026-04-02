@@ -164,13 +164,24 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case "esc":
 			if m.screen == screenSettings {
+				if m.settings.inputMode {
+					// Forward ESC to settings to exit custom-input mode only
+					updated, cmd := m.settings.Update(msg)
+					m.settings = updated
+					return m, cmd
+				}
+				// When not in input mode, ESC does nothing (use q to close settings)
+				return m, nil
+			}
+		case "q":
+			if m.screen == screenSettings {
+				// q closes settings and returns to previous screen
 				m.screen = screenSelector
 				if m.viewer != nil {
 					m.screen = screenViewer
 				}
 				return m, nil
 			}
-		case "q":
 			// q quits from selector; in viewer, handled below (allows back)
 			if m.screen == screenSelector {
 				return m, tea.Quit
@@ -326,7 +337,7 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		HSLoadedMsg, HSChunkMsg, HSDoneMsg,
 		HALoadedMsg, HAChunkMsg, HADoneMsg,
 		WatcherDebugMsg,
-		hsNavDebounceMsg, teeCheckMsg,
+		teeCheckMsg,
 		HistoryLoadedMsg, StatusMsg, InitStepMsg, spinnerTickMsg:
 		if m.viewer != nil {
 			updated, cmd := m.viewer.Update(msg)

@@ -26,16 +26,16 @@ No preamble. No explanation. Output only the summary.`
 func FormatInstruction(format string) string {
 	switch format {
 	case "bullets":
-		return "Format as a bullet-point list. Use - as the bullet character."
-	case "numbered":
-		return "Format as a numbered list (1. 2. 3. ...)."
-	case "prose":
-		return "Write as flowing prose paragraphs (no lists)."
+		return "Format as a bullet-point list **summarizing the key points**. Use - as the bullet character."
+	case "translate-only":
+		return "Translate faithfully and directly. Do not summarize or condense. Preserve all details and structure from the original."
+	case "conversational":
+		return "Summarize in casual, conversational language as if explaining to a colleague. Use natural flowing sentences without bullet points."
 	default:
 		if format != "" {
 			return format // custom instruction passed through verbatim
 		}
-		return "Format as a bullet-point list. Use - as the bullet character."
+		return "Format as a bullet-point list summarizing the key points. Use - as the bullet character."
 	}
 }
 
