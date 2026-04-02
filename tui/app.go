@@ -20,18 +20,19 @@ const (
 
 // AppModel is the root bubbletea model.
 type AppModel struct {
-	screen          appScreen
-	selector        SelectorModel
-	viewer          *ViewerModel
-	settings        SettingsModel
-	trans           *translator.Translator
-	outputLang      string
-	width           int
-	height          int
-	fatalErr        error
-	sdkLogCh        chan string
-	sdkRetryCount   int
-	pendingSession  *session.SessionInfo
+	screen         appScreen
+	selector       SelectorModel
+	viewer         *ViewerModel
+	settings       SettingsModel
+	sessionWatcher *session.StateWatcher
+	trans          *translator.Translator
+	outputLang     string
+	width          int
+	height         int
+	fatalErr       error
+	sdkLogCh       chan string
+	sdkRetryCount  int
+	pendingSession *session.SessionInfo
 }
 
 // translatorReadyMsg is sent when the Copilot SDK client is initialized.
@@ -51,6 +52,15 @@ type viewerReadyMsg struct {
 	watcher *session.Watcher
 	steps   []InitStepMsg
 }
+
+type sessionWatcherReadyMsg struct {
+	watcher *session.StateWatcher
+	err     error
+}
+
+type sessionsChangedMsg struct{}
+
+type sessionWatcherErrMsg struct{ err error }
 
 // initTranslatorCmd starts the Copilot SDK client asynchronously.
 func initTranslatorCmd(logCh chan string) tea.Cmd {
@@ -90,6 +100,38 @@ func startViewerCmd(info session.SessionInfo, trans *translator.Translator) tea.
 	}
 }
 
+func startSessionWatcherCmd() tea.Cmd {
+	return func() tea.Msg {
+		watcher, err := session.NewStateWatcher()
+		if err != nil {
+			return sessionWatcherReadyMsg{err: err}
+		}
+		if err := watcher.Start(); err != nil {
+			return sessionWatcherReadyMsg{err: err}
+		}
+		return sessionWatcherReadyMsg{watcher: watcher}
+	}
+}
+
+func waitForSessionChange(ch <-chan struct{}) tea.Cmd {
+	return func() tea.Msg {
+		if _, ok := <-ch; !ok {
+			return nil
+		}
+		return sessionsChangedMsg{}
+	}
+}
+
+func waitForSessionWatcherErr(ch <-chan error) tea.Cmd {
+	return func() tea.Msg {
+		err, ok := <-ch
+		if !ok {
+			return nil
+		}
+		return sessionWatcherErrMsg{err: err}
+	}
+}
+
 // NewAppModel creates the root model. Translator is initialized asynchronously.
 func NewAppModel() *AppModel {
 	cfg, _ := config.Load()
@@ -104,6 +146,9 @@ func NewAppModel() *AppModel {
 
 // Close releases all resources.
 func (m *AppModel) Close() {
+	if m.sessionWatcher != nil {
+		m.sessionWatcher.Stop()
+	}
 	if m.viewer != nil {
 		if m.viewer.watcher != nil {
 			m.viewer.watcher.Stop()
@@ -126,6 +171,7 @@ func (m *AppModel) Close() {
 func (m AppModel) Init() tea.Cmd {
 	return tea.Batch(
 		m.selector.Init(),
+		startSessionWatcherCmd(),
 		initTranslatorCmd(m.sdkLogCh),
 		waitForSDKLog(m.sdkLogCh),
 	)
@@ -152,6 +198,9 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				// When not in input mode, ESC does nothing (use q to close settings)
 				return m, nil
+			}
+			if m.screen == screenViewer {
+				return m, tea.Quit
 			}
 		case "q":
 			if m.screen == screenSettings {
@@ -199,7 +248,7 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.pendingSession = nil
 				m.selector.err = nil
 				m.screen = screenViewer
-				vm := NewViewerModel(*pending, m.trans, m.selector.sessions)
+				vm := NewViewerModel(*pending, m.trans)
 				vm.width, vm.height = m.width, m.height
 				vm.outputLang = m.trans.GetLanguage()
 				vm.outputFormat = m.trans.GetFormat()
@@ -211,6 +260,18 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		return m, nil
+
+	case sessionWatcherReadyMsg:
+		if msg.err != nil {
+			m.selector.watchErr = msg.err
+			return m, nil
+		}
+		m.sessionWatcher = msg.watcher
+		m.selector.watchErr = nil
+		return m, tea.Batch(
+			waitForSessionChange(msg.watcher.Changes()),
+			waitForSessionWatcherErr(msg.watcher.Errors()),
+		)
 
 	case sdkRetryMsg:
 		return m, initTranslatorCmd(m.sdkLogCh)
@@ -225,6 +286,22 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, tea.Batch(cmds...)
 
+	case sessionsChangedMsg:
+		var cmds []tea.Cmd
+		m.selector.watchErr = nil
+		if m.sessionWatcher != nil {
+			cmds = append(cmds, waitForSessionChange(m.sessionWatcher.Changes()))
+		}
+		cmds = append(cmds, DetectSessionsCmd())
+		return m, tea.Batch(cmds...)
+
+	case sessionWatcherErrMsg:
+		m.selector.watchErr = msg.err
+		if m.sessionWatcher != nil {
+			return m, waitForSessionWatcherErr(m.sessionWatcher.Errors())
+		}
+		return m, nil
+
 	case SessionSelectedMsg:
 		if m.trans == nil {
 			sess := msg.Session
@@ -233,7 +310,7 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.screen = screenViewer
-		vm := NewViewerModel(msg.Session, m.trans, m.selector.sessions)
+		vm := NewViewerModel(msg.Session, m.trans)
 		vm.width, vm.height = m.width, m.height
 		vm.outputLang = m.trans.GetLanguage()
 		vm.outputFormat = m.trans.GetFormat()
@@ -319,7 +396,8 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.viewer = nil
 		m.screen = screenSelector
 		// Refresh sessions list
-		return m, tea.Batch(m.selector.Init(), DetectSessionsCmd())
+		m.selector.loading = true
+		return m, tea.Batch(DetectSessionsCmd(), spinnerCmd())
 
 	// Viewer messages
 	case ReasoningDetectedMsg,
@@ -347,9 +425,6 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, cmd
 		}
 		if m.screen == screenViewer && m.viewer != nil {
-			if msg.String() == "q" {
-				return m, tea.Quit
-			}
 			if msg.String() == "r" {
 				m.viewer.rtTurns = nil
 				m.viewer.rtQ = nil

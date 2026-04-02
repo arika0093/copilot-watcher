@@ -18,6 +18,7 @@ type SelectorModel struct {
 	width       int
 	height      int
 	err         error
+	watchErr    error
 	loading     bool
 	spinnerTick int
 }
@@ -49,6 +50,68 @@ func NewSelectorModel() SelectorModel {
 	return SelectorModel{loading: true}
 }
 
+func (m SelectorModel) panelBodyHeight() int {
+	h := m.height
+	if h <= 0 {
+		h = 24
+	}
+	bodyH := h - 5
+	if bodyH < 3 {
+		bodyH = 3
+	}
+	return bodyH
+}
+
+func (m SelectorModel) visibleSessionWindow() (start, end int) {
+	rows := m.panelBodyHeight() - 2 // column header + divider
+	if rows < 1 {
+		rows = 1
+	}
+	if len(m.sessions) <= rows {
+		return 0, len(m.sessions)
+	}
+	start = m.cursor - rows/2
+	if start < 0 {
+		start = 0
+	}
+	maxStart := len(m.sessions) - rows
+	if start > maxStart {
+		start = maxStart
+	}
+	return start, start + rows
+}
+
+func (m *SelectorModel) applySessions(sessions []session.SessionInfo) {
+	selectedID := ""
+	if m.cursor >= 0 && m.cursor < len(m.sessions) {
+		selectedID = m.sessions[m.cursor].SessionID
+	}
+
+	m.sessions = sessions
+	m.err = nil
+
+	if len(m.sessions) == 0 {
+		m.cursor = 0
+		return
+	}
+
+	if selectedID != "" {
+		for i, s := range m.sessions {
+			if s.SessionID == selectedID {
+				m.cursor = i
+				return
+			}
+		}
+	}
+
+	if m.cursor >= len(m.sessions) {
+		m.cursor = len(m.sessions) - 1
+	}
+	if m.cursor < 0 {
+		m.cursor = 0
+	}
+}
+
 func (m SelectorModel) Init() tea.Cmd {
 	return tea.Batch(DetectSessionsCmd(), spinnerCmd())
 }
@@ -69,7 +132,7 @@ func (m SelectorModel) Update(msg tea.Msg) (SelectorModel, tea.Cmd) {
 		if msg.Err != nil {
 			m.err = msg.Err
 		} else {
-			m.sessions = msg.Sessions
+			m.applySessions(msg.Sessions)
 		}
 
 	case tea.MouseMsg:
@@ -83,12 +146,13 @@ func (m SelectorModel) Update(msg tea.Msg) (SelectorModel, tea.Cmd) {
 				m.cursor++
 			}
 		case tea.MouseButtonLeft:
-			if msg.Action == tea.MouseActionRelease {
+			if msg.Action == tea.MouseActionRelease && !m.loading && m.err == nil {
 				// Sessions list starts at y=6 (header + 2 blank lines + panel top + col header + divider)
 				const sessionListStartY = 6
 				idx := msg.Y - sessionListStartY
-				if idx >= 0 && idx < len(m.sessions) {
-					m.cursor = idx
+				start, end := m.visibleSessionWindow()
+				if idx >= 0 && idx < end-start {
+					m.cursor = start + idx
 					return m, func() tea.Msg {
 						return SessionSelectedMsg{Session: m.sessions[m.cursor]}
 					}
@@ -126,6 +190,7 @@ func (m SelectorModel) View() string {
 		w = 80
 	}
 	inner := w - 4 // account for border + padding
+	bodyH := m.panelBodyHeight()
 
 	var sb strings.Builder
 
@@ -135,20 +200,17 @@ func (m SelectorModel) View() string {
 	sb.WriteString("\n\n")
 
 	// ── Session list panel ──────────────────────────────────────────
-	var body strings.Builder
+	var bodyLines []string
 	if m.loading {
 		spinner := WarnStyle.Render(SpinnerFrames[m.spinnerTick])
-		body.WriteString(fmt.Sprintf("  %s  Scanning for active sessions...\n", spinner))
+		bodyLines = append(bodyLines, fmt.Sprintf("  %s  Scanning for active sessions...", spinner))
 	} else if m.err != nil {
-		body.WriteString(ErrorStyle.Render(fmt.Sprintf("  ✗ Error: %v", m.err)))
-		body.WriteString("\n")
+		bodyLines = append(bodyLines, ErrorStyle.Render(fmt.Sprintf("  ✗ Error: %v", m.err)))
 	} else if len(m.sessions) == 0 {
-		body.WriteString(WarnStyle.Render("  No Copilot CLI sessions found."))
-		body.WriteString("\n")
-		body.WriteString(MutedStyle.Render("  Sessions appear after the first message is sent in Copilot CLI."))
-		body.WriteString("\n")
-		body.WriteString(MutedStyle.Render("  Press [r] to refresh."))
-		body.WriteString("\n")
+		bodyLines = append(bodyLines, WarnStyle.Render("  No Copilot CLI sessions found."))
+		bodyLines = append(bodyLines, MutedStyle.Render("  Sessions appear after the first message is sent in Copilot CLI."))
+		bodyLines = append(bodyLines, MutedStyle.Render("  Watching ~\\.copilot\\session-state for new sessions."))
+		bodyLines = append(bodyLines, MutedStyle.Render("  Press [r] to refresh."))
 	} else {
 		// Fixed-width column helpers using lipgloss to avoid ANSI-length issues
 		colSID := func(s string) string { return lipgloss.NewStyle().Width(8).MaxWidth(8).Render(s) }
@@ -158,12 +220,12 @@ func (m SelectorModel) View() string {
 
 		// Column headers
 		hdr := "  " + colSID("SESSION") + "  " + colCWD("CWD") + "  " + colPID("PID") + "  " + colAge("AGE") + "  " + "STATUS"
-		body.WriteString(DimStyle.Render(hdr))
-		body.WriteString("\n")
-		body.WriteString(DimStyle.Render("  " + strings.Repeat("─", inner-2)))
-		body.WriteString("\n")
+		bodyLines = append(bodyLines, DimStyle.Render(hdr))
+		bodyLines = append(bodyLines, DimStyle.Render("  "+strings.Repeat("─", inner-2)))
 
-		for i, s := range m.sessions {
+		start, end := m.visibleSessionWindow()
+		for i := start; i < end; i++ {
+			s := m.sessions[i]
 			sid := s.SessionID
 			if len(sid) > 8 {
 				sid = sid[:8]
@@ -185,30 +247,38 @@ func (m SelectorModel) View() string {
 				statusStr = MutedStyle.Render("○ inactive")
 			}
 
+			marker := "  "
 			if i == m.cursor {
-				body.WriteString(" ❯ " + SelectedStyle.Render(
+				marker = "> "
+				bodyLines = append(bodyLines, marker+SelectedStyle.Render(
 					colSID(sid)+"  "+colCWD(cwd)+"  "+colPID(pidStr)+"  "+colAge(age)+"  ",
-				) + statusStr)
+				)+statusStr)
 			} else {
-				body.WriteString("  " +
-					TitleStyle.Render(colSID(sid)) + "  " +
-					TextStyle.Render(colCWD(cwd)) + "  " +
-					PIDStyle.Render(colPID(pidStr)) + "  " +
-					MutedStyle.Render(colAge(age)) + "  " +
+				bodyLines = append(bodyLines, marker+
+					TitleStyle.Render(colSID(sid))+"  "+
+					TextStyle.Render(colCWD(cwd))+"  "+
+					PIDStyle.Render(colPID(pidStr))+"  "+
+					MutedStyle.Render(colAge(age))+"  "+
 					statusStr,
 				)
 			}
-			body.WriteString("\n")
 		}
 	}
 
-	panel := renderPanel(" Sessions ", body.String(), w)
+	if len(bodyLines) > bodyH {
+		bodyLines = bodyLines[:bodyH]
+	}
+
+	panel := renderPanel(" Sessions ", strings.Join(bodyLines, "\n"), w)
 	sb.WriteString(panel)
 	sb.WriteString("\n")
 
 	// ── Help bar ─────────────────────────────────────────────────────
-	help := HelpStyle.Render("  [↑↓] navigate   [enter] select   [r] refresh   [s] settings   [q] quit")
-	sb.WriteString(help)
+	help := "  [↑↓] navigate   [enter] select   [r] refresh   [s] settings   [q] quit"
+	sb.WriteString(HelpStyle.Render(help))
+	if m.watchErr != nil {
+		sb.WriteString(ErrorStyle.Render("   auto-refresh unavailable"))
+	}
 
 	return sb.String()
 }

@@ -68,10 +68,10 @@ func TranslateUserPrompt(reasoningText, lang, format string) string {
 		lang, FormatInstruction(format), StripXMLTags(reasoningText))
 }
 
-// SessionSummaryUserPrompt builds the user message for a per-session summary.
+// SessionSummaryUserPrompt builds the user message for a whole-session summary.
 func SessionSummaryUserPrompt(label, reasoningText, lang, format string) string {
 	return fmt.Sprintf(
-		"Language: %s\nFormat: %s\nSession: %s\nTask: Summarize this request. Focus on: (1) what problem or goal was presented, and (2) what was actually done or decided to address it. Be concise.\n\n%s",
+		"Language: %s\nFormat: %s\nSession: %s\nTask: Summarize this entire Copilot CLI session as one cohesive interaction history. Focus on: (1) the main goals or requests across the session, (2) what was investigated, changed, or decided, and (3) the overall outcome. Do not summarize each turn in isolation unless the format strongly calls for it.\n\n%s",
 		lang, FormatInstruction(format), label, StripXMLTags(reasoningText),
 	)
 }

@@ -19,7 +19,7 @@ type TabID int
 const (
 	TabRealtime        TabID = iota // events.jsonl based
 	TabHistorySessions              // per-session AI summary
-	TabHistoryAll                   // combined summary of all sessions
+	TabHistoryAll                   // summary of the current session as a whole
 	TabDebug                        // initialization log and debug messages
 )
 
@@ -30,9 +30,13 @@ type ReasoningDetectedMsg session.ReasoningMsg
 // Real-time tab translation
 type RTChunkMsg struct {
 	Idx  int
+	Gen  int
 	Text string
 }
-type RTDoneMsg struct{ Idx int }
+type RTDoneMsg struct {
+	Idx int
+	Gen int
+}
 
 // History: Sessions tab
 type HSLoadedMsg struct {
@@ -79,7 +83,7 @@ type WatcherDebugMsg struct{ Text string }
 
 type viewTurn struct {
 	turnNum     int
-	label       string // for history tabs: session ID / "All Sessions"
+	label       string // for history tabs: session identifier / session summary label
 	userMsg     string
 	reasoning   string // AI internal reasoning text
 	response    string // AI response content (non-reasoning)
@@ -88,6 +92,7 @@ type viewTurn struct {
 	errMsg      string // non-empty when the translation API returned an error
 	translating bool
 	done        bool
+	liveOpen    bool
 	timestamp   time.Time
 }
 
@@ -96,9 +101,8 @@ func (t *viewTurn) translationStr() string { return t.translation.String() }
 // ── ViewerModel ────────────────────────────────────────────────────────────────
 
 type ViewerModel struct {
-	info        session.SessionInfo
-	trans       *translator.Translator
-	allSessions []session.SessionInfo
+	info  session.SessionInfo
+	trans *translator.Translator
 
 	activeTab TabID
 
@@ -106,6 +110,7 @@ type ViewerModel struct {
 	rtTurns      []*viewTurn
 	rtCursor     int // 0 = newest, increments toward older
 	rtQ          []int
+	rtGeneration int
 	rtCh         <-chan string
 	rtCancel     context.CancelFunc
 	rtStreamMode bool // false = turn-by-turn mode, true = streaming (live) mode
@@ -141,17 +146,17 @@ type ViewerModel struct {
 	watcher *session.Watcher
 }
 
-func NewViewerModel(info session.SessionInfo, trans *translator.Translator, allSessions []session.SessionInfo) ViewerModel {
+func NewViewerModel(info session.SessionInfo, trans *translator.Translator) ViewerModel {
 	return ViewerModel{
 		info:         info,
 		trans:        trans,
-		allSessions:  allSessions,
 		activeTab:    TabRealtime,
 		scroll:       map[TabID]int{},
 		status:       "Initializing...",
 		statusOK:     false,
 		outputLang:   trans.GetLanguage(),
 		outputFormat: trans.GetFormat(),
+		rtStreamMode: true,
 	}
 }
 
@@ -185,27 +190,31 @@ func loadHistorySessionsCmd(eventsPath string) tea.Cmd {
 	}
 }
 
-func loadHistoryAllCmd(allSessions []session.SessionInfo) tea.Cmd {
+func loadSessionAllCmd(info session.SessionInfo) tea.Cmd {
 	return func() tea.Msg {
-		all, err := session.LoadAllSessions()
+		turns, err := session.LoadHistory(info.EventsPath)
 		if err != nil {
 			return HALoadedMsg{Err: err}
 		}
-		if len(all) == 0 {
-			all = allSessions
-		}
 		var sb strings.Builder
-		for _, s := range all {
-			turns, err := session.LoadHistory(s.EventsPath)
-			if err != nil || len(turns) == 0 {
-				continue
+		for i, t := range turns {
+			if sb.Len() > 0 {
+				sb.WriteString("\n\n")
 			}
-			sb.WriteString(fmt.Sprintf("=== Session %s (%s) ===\n", s.SessionID[:8], s.Cwd))
-			for _, t := range turns {
-				if t.ReasoningText != "" {
-					sb.WriteString(t.ReasoningText)
-					sb.WriteString("\n---\n")
-				}
+			sb.WriteString(fmt.Sprintf("=== Request %d ===\n", i+1))
+			if t.UserMessage != "" {
+				sb.WriteString("User request:\n")
+				sb.WriteString(t.UserMessage)
+				sb.WriteString("\n\n")
+			}
+			if t.ReasoningText != "" {
+				sb.WriteString("AI internal reasoning:\n")
+				sb.WriteString(t.ReasoningText)
+				sb.WriteString("\n\n")
+			}
+			if t.Response != "" {
+				sb.WriteString("AI response:\n")
+				sb.WriteString(t.Response)
 			}
 		}
 		return HALoadedMsg{Reasoning: sb.String()}
@@ -243,13 +252,13 @@ func waitForReasoning(ch <-chan session.ReasoningMsg) tea.Cmd {
 	}
 }
 
-func waitForRTChunk(idx int, ch <-chan string) tea.Cmd {
+func waitForRTChunk(idx, gen int, ch <-chan string) tea.Cmd {
 	return func() tea.Msg {
 		text, ok := <-ch
 		if !ok {
-			return RTDoneMsg{Idx: idx}
+			return RTDoneMsg{Idx: idx, Gen: gen}
 		}
-		return RTChunkMsg{Idx: idx, Text: text}
+		return RTChunkMsg{Idx: idx, Gen: gen, Text: text}
 	}
 }
 
@@ -289,17 +298,20 @@ func (m *ViewerModel) startNextRT() tea.Cmd {
 		if m.rtCancel != nil {
 			m.rtCancel()
 		}
+		m.rtGeneration++
+		gen := m.rtGeneration
 		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 		m.rtCancel = cancel
 		ch, err := m.trans.Translate(ctx, t.reasoning)
 		if err != nil {
-			t.translation.WriteString(fmt.Sprintf("Translation error: %v", err))
-			t.done = true
+			t.errMsg = err.Error()
+			t.translating = false
+			t.done = !t.liveOpen
 			return m.startNextRT()
 		}
 		t.translating = true
 		m.rtCh = ch
-		return tea.Batch(waitForRTChunk(idx, ch), spinnerCmd())
+		return tea.Batch(waitForRTChunk(idx, gen, ch), spinnerCmd())
 	}
 	return nil
 }
@@ -381,7 +393,7 @@ func (m *ViewerModel) startHA() tea.Cmd {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	m.haCancel = cancel
-	ch, err := m.trans.SummarizeAll(ctx, m.haEntry.reasoning)
+	ch, err := m.trans.SummarizeSession(ctx, m.haEntry.label, m.haEntry.reasoning)
 	if err != nil {
 		m.haEntry.translation.WriteString(fmt.Sprintf("Translation error: %v", err))
 		m.haEntry.done = true
@@ -504,7 +516,7 @@ func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
 			// Find existing open turn with same userMsg
 			foundIdx := -1
 			for i := len(m.rtTurns) - 1; i >= 0; i-- {
-				if m.rtTurns[i].userMsg == msg.UserMessage && !m.rtTurns[i].done {
+				if m.rtTurns[i].userMsg == msg.UserMessage && m.rtTurns[i].liveOpen {
 					foundIdx = i
 					break
 				}
@@ -512,8 +524,14 @@ func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
 			if foundIdx >= 0 {
 				// Append to existing open turn and re-queue for translation
 				t := m.rtTurns[foundIdx]
+				if t.translating && m.rtCancel != nil {
+					m.rtCancel()
+				}
+				t.translating = false
+				t.done = false
+				t.errMsg = ""
+				t.translation.Reset()
 				t.reasoning += msg.ReasoningText
-				// Re-queue with priority (cancel old translation, start fresh)
 				m.rtQ = append([]int{foundIdx}, m.rtQ...)
 				cmds = append(cmds, m.startNextRT())
 			} else {
@@ -524,6 +542,7 @@ func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
 					reasoning:   msg.ReasoningText,
 					isReasoning: true,
 					done:        false,
+					liveOpen:    true,
 					timestamp:   msg.Timestamp,
 				}
 				m.rtTurns = append(m.rtTurns, vt)
@@ -536,21 +555,72 @@ func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
 		}
 		// Partial=false: final turn_end msg
 		if m.rtStreamMode {
-			// Stream mode: find open partial turn and mark done
+			// Stream mode: finalize the open partial turn for this request.
+			foundIdx := -1
 			for i := len(m.rtTurns) - 1; i >= 0; i-- {
-				if m.rtTurns[i].userMsg == msg.UserMessage && !m.rtTurns[i].done {
-					m.rtTurns[i].done = true
-					// Update full content if available
-					if msg.ContentText != "" {
-						m.rtTurns[i].response = msg.ContentText
-					}
-					m.debugLog = append(m.debugLog, dbgf("RT stream turn #%d finalized", i+1))
+				if m.rtTurns[i].userMsg == msg.UserMessage && m.rtTurns[i].liveOpen {
+					foundIdx = i
 					break
 				}
 			}
 			var cmds []tea.Cmd
 			if m.watcher != nil {
 				cmds = append(cmds, waitForReasoning(m.watcher.Chan()))
+			}
+			if foundIdx >= 0 {
+				t := m.rtTurns[foundIdx]
+				t.liveOpen = false
+				reasoningChanged := false
+				if msg.ReasoningText != "" {
+					reasoningChanged = t.reasoning != msg.ReasoningText
+					t.reasoning = msg.ReasoningText
+				}
+				if msg.ContentText != "" {
+					t.response = msg.ContentText
+				}
+				if reasoningChanged {
+					if t.translating && m.rtCancel != nil {
+						m.rtCancel()
+					}
+					t.translating = false
+					t.errMsg = ""
+					t.translation.Reset()
+					t.done = false
+					if t.reasoning != "" {
+						m.rtQ = append([]int{foundIdx}, m.rtQ...)
+						cmds = append(cmds, m.startNextRT())
+					} else {
+						t.done = true
+					}
+				} else if !t.translating && t.reasoning != "" && (t.translation.Len() == 0 || t.errMsg != "") {
+					t.errMsg = ""
+					t.translation.Reset()
+					t.done = false
+					m.rtQ = append([]int{foundIdx}, m.rtQ...)
+					cmds = append(cmds, m.startNextRT())
+				} else if !t.translating {
+					t.done = true
+				}
+				m.debugLog = append(m.debugLog, dbgf("RT stream turn #%d finalized", foundIdx+1))
+			} else {
+				vt := &viewTurn{
+					turnNum:     len(m.rtTurns) + 1,
+					userMsg:     msg.UserMessage,
+					reasoning:   msg.ReasoningText,
+					response:    msg.ContentText,
+					isReasoning: msg.ReasoningText != "",
+					timestamp:   msg.Timestamp,
+				}
+				if !vt.isReasoning {
+					vt.done = true
+				}
+				m.rtTurns = append(m.rtTurns, vt)
+				if vt.isReasoning {
+					idx := len(m.rtTurns) - 1
+					m.rtQ = append([]int{idx}, m.rtQ...)
+					cmds = append(cmds, m.startNextRT())
+				}
+				m.debugLog = append(m.debugLog, dbgf("RT stream turn created on final event (%d chars)", len(msg.ReasoningText)))
 			}
 			// Also update hsTurns
 			hsVt := &viewTurn{
@@ -620,6 +690,9 @@ func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
 		return m, tea.Batch(cmds...)
 
 	case RTChunkMsg:
+		if msg.Gen != m.rtGeneration {
+			return m, nil
+		}
 		if msg.Idx < len(m.rtTurns) {
 			t := m.rtTurns[msg.Idx]
 			if strings.HasPrefix(msg.Text, translator.StreamErrPrefix) {
@@ -629,13 +702,18 @@ func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
 				t.translation.WriteString(msg.Text)
 			}
 		}
-		return m, waitForRTChunk(msg.Idx, m.rtCh)
+		return m, waitForRTChunk(msg.Idx, msg.Gen, m.rtCh)
 
 	case RTDoneMsg:
+		if msg.Gen != m.rtGeneration {
+			return m, nil
+		}
 		if msg.Idx < len(m.rtTurns) {
 			t := m.rtTurns[msg.Idx]
 			t.translating = false
-			t.done = true
+			if !t.liveOpen {
+				t.done = true
+			}
 			if t.errMsg != "" {
 				m.debugLog = append(m.debugLog, dbgf("RT turn #%d completed with error", msg.Idx+1))
 			} else {
@@ -704,22 +782,25 @@ func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
 		}
 		return m, m.startNextHS()
 
-
 	// History: All tab
 	case HALoadedMsg:
 		if msg.Err != nil {
-			vt := &viewTurn{turnNum: 1, label: "All Sessions"}
+			vt := &viewTurn{turnNum: 1, label: sessionSummaryLabel(m.info)}
 			vt.translation.WriteString(fmt.Sprintf("Load error: %v", msg.Err))
 			vt.done = true
 			m.haEntry = vt
-			m.debugLog = append(m.debugLog, dbgf("ALL-SESSIONS load error: %v", msg.Err))
+			m.debugLog = append(m.debugLog, dbgf("SESSION-ALL load error: %v", msg.Err))
 		} else {
 			m.haEntry = &viewTurn{
 				turnNum:   1,
-				label:     "All Sessions",
+				label:     sessionSummaryLabel(m.info),
 				reasoning: msg.Reasoning,
 			}
-			m.debugLog = append(m.debugLog, dbgf("ALL-SESSIONS loaded %d chars of reasoning", len(msg.Reasoning)))
+			if msg.Reasoning == "" {
+				m.haEntry.translation.WriteString("No requests found for this session yet.")
+				m.haEntry.done = true
+			}
+			m.debugLog = append(m.debugLog, dbgf("SESSION-ALL loaded %d chars of session context", len(msg.Reasoning)))
 		}
 		if m.trans != nil && m.haEntry != nil && !m.haEntry.done {
 			return m, m.startHA()
@@ -741,9 +822,9 @@ func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
 			m.haEntry.translating = false
 			m.haEntry.done = true
 			if m.haEntry.errMsg != "" {
-				m.debugLog = append(m.debugLog, dbgf("ALL-SESSIONS API error: %s", m.haEntry.errMsg))
+				m.debugLog = append(m.debugLog, dbgf("SESSION-ALL API error: %s", m.haEntry.errMsg))
 			} else {
-				m.debugLog = append(m.debugLog, dbgf("ALL-SESSIONS summary done (%d chars)", len(m.haEntry.translationStr())))
+				m.debugLog = append(m.debugLog, dbgf("SESSION-ALL summary done (%d chars)", len(m.haEntry.translationStr())))
 			}
 		}
 
@@ -770,7 +851,7 @@ func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
 
 	case tea.KeyMsg:
 		switch msg.String() {
-		case "esc", "b":
+		case "q", "b":
 			return m, func() tea.Msg { return BackToListMsg{} }
 		case "1":
 			m.activeTab = TabRealtime
@@ -782,17 +863,17 @@ func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
 				return m, m.startHSAtCursor()
 			}
 		case "3":
-			// Always reload all-sessions summary when switching to this tab
+			// Always reload the current-session summary when switching to this tab.
 			m.activeTab = TabHistoryAll
 			if m.haCancel != nil {
 				m.haCancel()
 				m.haCancel = nil
 			}
 			m.haEntry = nil
-			m.debugLog = append(m.debugLog, dbgf("TAB switched to History: All → reloading"))
+			m.debugLog = append(m.debugLog, dbgf("TAB switched to Session All → reloading"))
 			return m, tea.Batch(
-				func() tea.Msg { return InitStepMsg{Step: "Refreshing all-sessions summary...", OK: true} },
-				loadHistoryAllCmd(m.allSessions),
+				func() tea.Msg { return InitStepMsg{Step: "Refreshing current-session summary...", OK: true} },
+				loadSessionAllCmd(m.info),
 			)
 		case "4":
 			m.activeTab = TabDebug
@@ -918,7 +999,7 @@ func (m ViewerModel) View() string {
 		logLines = append(logLines, fmt.Sprintf("  %s  %s", spin, WarnStyle.Render("Starting watchers...")))
 		sb.WriteString(renderPanel(" Initialization ", strings.Join(logLines, "\n"), w))
 		sb.WriteString("\n")
-		sb.WriteString(HelpStyle.Render("  [esc] back   [q] quit"))
+		sb.WriteString(HelpStyle.Render("  [q] back   [esc] quit"))
 		return sb.String()
 	}
 
@@ -929,7 +1010,12 @@ func (m ViewerModel) View() string {
 		contentH = 3
 	}
 
-	allLines := m.buildTabLines(w)
+	panelContentW := w - 4
+	if panelContentW < 20 {
+		panelContentW = 20
+	}
+
+	allLines := m.buildTabLines(panelContentW)
 
 	offset := m.scroll[m.activeTab]
 	maxOffset := len(allLines) - contentH
@@ -959,7 +1045,7 @@ func (m ViewerModel) View() string {
 		scrollInfo = fmt.Sprintf("   [%d/%d lines]", offset+1, len(allLines))
 	}
 	help := HelpStyle.Render(fmt.Sprintf(
-		"  [esc/b] back   [1-4] tab   [↑↓/kj] scroll   [g/G] top/bottom   [q] quit%s",
+		"  [q] back   [1-4] tab   [↑↓/kj] scroll   [g/G] top/bottom   [esc] quit%s",
 		scrollInfo,
 	))
 	sb.WriteString(help)
@@ -974,7 +1060,7 @@ func (m ViewerModel) renderTabBar(w int) string {
 	tabs := []tabDef{
 		{TabRealtime, "[1] Live"},
 		{TabHistorySessions, "[2] Requests"},
-		{TabHistoryAll, "[3] All"},
+		{TabHistoryAll, "[3] Session"},
 		{TabDebug, "[4] Debug"},
 	}
 	var parts []string
@@ -1019,7 +1105,7 @@ func (m ViewerModel) buildPanelTitle() string {
 			title += " · " + WarnStyle.Render(SpinnerFrames[m.spinnerTick]+" translating")
 		}
 	case TabHistoryAll:
-		title = " All Sessions"
+		title = " Session All"
 		if m.haEntry != nil && m.haEntry.translating {
 			title += " · " + WarnStyle.Render(SpinnerFrames[m.spinnerTick]+" summarizing")
 		}
@@ -1046,9 +1132,15 @@ func (m ViewerModel) buildTabLines(w int) []string {
 
 func (m ViewerModel) buildRTLines(w int) []string {
 	if len(m.rtTurns) == 0 {
+		modeLine := MutedStyle.Render("  Mode: [m] turn-by-turn")
+		if m.rtStreamMode {
+			modeLine = MutedStyle.Render("  Mode: [m] streaming (live)")
+		}
 		return []string{
 			"",
 			WarnStyle.Render("  Waiting for Copilot CLI to produce reasoning output..."),
+			modeLine,
+			MutedStyle.Render("  Press [m] to switch modes while waiting."),
 			MutedStyle.Render("  (New reasoning steps will appear here as Copilot processes requests)"),
 			"",
 		}
@@ -1098,9 +1190,17 @@ func (m ViewerModel) buildHSLines(w int) []string {
 
 func (m ViewerModel) buildHALines(w int) []string {
 	if m.haEntry == nil {
-		return []string{"", WarnStyle.Render("  Loading all-sessions summary..."), ""}
+		return []string{"", WarnStyle.Render("  Loading current-session summary..."), ""}
 	}
 	return buildHistoryBlock(m.haEntry, w, m.spinnerTick)
+}
+
+func sessionSummaryLabel(info session.SessionInfo) string {
+	sid := info.SessionID
+	if len(sid) > 8 {
+		sid = sid[:8]
+	}
+	return fmt.Sprintf("Session %s", sid)
 }
 
 func (m ViewerModel) buildDebugLines(w int) []string {
@@ -1139,17 +1239,24 @@ func buildNavBar(cursor, total int, kind string, ts time.Time, w int) []string {
 		navStr = "   " + strings.Join(navParts, "   ")
 	}
 	tsStr := timeAgo(ts)
-	if tsStr != "" {
-		tsRendered := MutedStyle.Render(tsStr)
-		leftWidth := lipgloss.Width(leftStr) + lipgloss.Width(navStr)
-		tsWidth := lipgloss.Width(tsRendered)
-		pad := w - leftWidth - tsWidth - 2
-		if pad > 1 {
-			return []string{leftStr + navStr + strings.Repeat(" ", pad) + tsRendered}
-		}
-		return []string{leftStr + navStr + "   " + tsRendered}
+	fullLeft := leftStr + navStr
+	if tsStr == "" {
+		return []string{fullLeft}
 	}
-	return []string{leftStr + navStr}
+
+	tsRendered := MutedStyle.Render(tsStr)
+	fullLeftWidth := lipgloss.Width(fullLeft)
+	tsWidth := lipgloss.Width(tsRendered)
+	if pad := w - fullLeftWidth - tsWidth; pad >= 3 {
+		return []string{fullLeft + strings.Repeat(" ", pad) + tsRendered}
+	}
+
+	leftOnlyWidth := lipgloss.Width(leftStr)
+	if pad := w - leftOnlyWidth - tsWidth; pad >= 3 {
+		return []string{leftStr + strings.Repeat(" ", pad) + tsRendered}
+	}
+
+	return []string{fullLeft}
 }
 
 // timeAgo formats a time as a human-readable "X ago" string.
@@ -1238,7 +1345,7 @@ func buildResponseLines(t *viewTurn, textMaxW int) []string {
 	return []string{MutedStyle.Render("  (no response content)")}
 }
 
-// buildHistoryBlock builds lines for a history entry (All Sessions tab).
+// buildHistoryBlock builds lines for a history entry in the session-summary tab.
 func buildHistoryBlock(t *viewTurn, w int, spinTick int) []string {
 	var lines []string
 	textMaxW := w - 6

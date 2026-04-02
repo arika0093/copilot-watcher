@@ -15,17 +15,35 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-const sessionStateDir = ".copilot/session-state"
+const (
+	copilotDirName      = ".copilot"
+	sessionStateDirName = "session-state"
+)
+
+func copilotDirPath() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("cannot find home dir: %w", err)
+	}
+	return filepath.Join(home, copilotDirName), nil
+}
+
+func sessionStatePath() (string, error) {
+	rootDir, err := copilotDirPath()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(rootDir, sessionStateDirName), nil
+}
 
 // Detect scans ~/.copilot/session-state for all Copilot CLI sessions.
 // Sessions with a live process are marked Active=true; others are included too
 // so the user can browse history even when Copilot CLI is not running.
 func Detect() ([]SessionInfo, error) {
-	home, err := os.UserHomeDir()
+	stateDir, err := sessionStatePath()
 	if err != nil {
-		return nil, fmt.Errorf("cannot find home dir: %w", err)
+		return nil, err
 	}
-	stateDir := filepath.Join(home, sessionStateDir)
 
 	entries, err := os.ReadDir(stateDir)
 	if err != nil {
@@ -135,11 +153,10 @@ func isPIDAlive(pid int) bool {
 
 // LoadAllSessions returns all sessions regardless of active status, sorted newest first.
 func LoadAllSessions() ([]SessionInfo, error) {
-	home, err := os.UserHomeDir()
+	stateDir, err := sessionStatePath()
 	if err != nil {
-		return nil, fmt.Errorf("cannot find home dir: %w", err)
+		return nil, err
 	}
-	stateDir := filepath.Join(home, sessionStateDir)
 	entries, err := os.ReadDir(stateDir)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -184,7 +201,7 @@ func LoadAllSessions() ([]SessionInfo, error) {
 }
 
 // LoadHistory reads all past turns from events.jsonl synchronously.
-// Returns turns with ReasoningText populated (where available).
+// Returns turns with reasoning and/or response content populated (where available).
 func LoadHistory(eventsPath string) ([]Turn, error) {
 	f, err := os.Open(eventsPath)
 	if err != nil {
@@ -209,7 +226,7 @@ func LoadHistory(eventsPath string) ([]Turn, error) {
 		switch evt.Type {
 		case "user.message":
 			// Start of new turn
-			if currentUser != "" && currentReasoning != "" {
+			if currentUser != "" && (currentReasoning != "" || currentContent != "") {
 				turns = append(turns, Turn{
 					UserMessage:   currentUser,
 					ReasoningText: currentReasoning,
@@ -235,8 +252,8 @@ func LoadHistory(eventsPath string) ([]Turn, error) {
 				}
 			}
 		case "assistant.turn_end":
-			// Finalize turn when reasoning was found
-			if currentUser != "" && currentReasoning != "" {
+			// Finalize turn when any assistant output was found
+			if currentUser != "" && (currentReasoning != "" || currentContent != "") {
 				turns = append(turns, Turn{
 					UserMessage:   currentUser,
 					ReasoningText: currentReasoning,

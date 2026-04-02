@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
@@ -76,7 +77,7 @@ func (w *Watcher) Start() error {
 		f.Close()
 		return err
 	}
-	if err := watcher.Add(w.eventsPath); err != nil {
+	if err := watcher.Add(filepath.Dir(w.eventsPath)); err != nil {
 		f.Close()
 		watcher.Close()
 		return err
@@ -94,16 +95,43 @@ func (w *Watcher) sendDbg(msg string) {
 }
 
 func (w *Watcher) readLoop(f *os.File, fw *fsnotify.Watcher) {
-	defer f.Close()
 	defer fw.Close()
 
-	reader := bufio.NewReader(f)
+	currentFile := f
+	reader := bufio.NewReader(currentFile)
 	var partial []byte // incomplete line buffered across reads
 	var pendingUser string
 	var pendingReasoning string
 	var pendingContent string
 	var pendingTS time.Time
 	lineCount := 0
+
+	closeCurrentFile := func() {
+		if currentFile != nil {
+			currentFile.Close()
+			currentFile = nil
+			reader = nil
+		}
+	}
+	defer closeCurrentFile()
+
+	reopenFile := func(seekToEnd bool) error {
+		nf, err := os.Open(w.eventsPath)
+		if err != nil {
+			return err
+		}
+		if seekToEnd {
+			if _, err := nf.Seek(0, io.SeekEnd); err != nil {
+				nf.Close()
+				return err
+			}
+		}
+		closeCurrentFile()
+		currentFile = nf
+		reader = bufio.NewReader(currentFile)
+		partial = nil
+		return nil
+	}
 
 	// flushCh is signalled by the debounce timer to process pending file data.
 	flushCh := make(chan struct{}, 1)
@@ -122,6 +150,9 @@ func (w *Watcher) readLoop(f *os.File, fw *fsnotify.Watcher) {
 	}
 
 	flush := func() {
+		if reader == nil {
+			return
+		}
 		linesRead := 0
 		for {
 			chunk, err := reader.ReadBytes('\n')
@@ -147,6 +178,8 @@ func (w *Watcher) readLoop(f *os.File, fw *fsnotify.Watcher) {
 		}
 	}
 
+	targetPath := filepath.Clean(w.eventsPath)
+
 	for {
 		select {
 		case <-w.done:
@@ -158,8 +191,29 @@ func (w *Watcher) readLoop(f *os.File, fw *fsnotify.Watcher) {
 			if !ok {
 				return
 			}
-			if evt.Op&(fsnotify.Write|fsnotify.Create) == 0 {
+			if filepath.Clean(evt.Name) != targetPath {
 				continue
+			}
+			if evt.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Remove|fsnotify.Rename) == 0 {
+				continue
+			}
+			if evt.Op&(fsnotify.Remove|fsnotify.Rename) != 0 {
+				flush()
+				closeCurrentFile()
+				w.sendDbg(fmt.Sprintf("events.jsonl handle reset after %s", evt.Op.String()))
+				continue
+			}
+			if evt.Op&fsnotify.Create != 0 {
+				if err := reopenFile(false); err != nil {
+					w.sendDbg(fmt.Sprintf("events.jsonl reopen failed: %v", err))
+					continue
+				}
+				w.sendDbg("events.jsonl reopened after create")
+			} else if currentFile == nil {
+				if err := reopenFile(false); err != nil {
+					w.sendDbg(fmt.Sprintf("events.jsonl reopen failed: %v", err))
+					continue
+				}
 			}
 			resetDebounce()
 		case <-flushCh:
