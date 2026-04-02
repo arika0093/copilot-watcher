@@ -1,0 +1,13 @@
+run:
+  timeout: 5m
+
+linters:
+  enable:
+    - govet
+    - errcheck
+    - staticcheck
+    - ineffassign
+    - misspell
+
+issues:
+  max-same-issues: 0
