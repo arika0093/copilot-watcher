@@ -2,10 +2,12 @@ package tui
 
 import (
 	"fmt"
+	"path/filepath"
 	"strings"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/copilot-watcher/copilot-watcher/session"
 )
 
@@ -148,26 +150,28 @@ func (m SelectorModel) View() string {
 		body.WriteString(MutedStyle.Render("  Press [r] to refresh."))
 		body.WriteString("\n")
 	} else {
+		// Fixed-width column helpers using lipgloss to avoid ANSI-length issues
+		colSID := func(s string) string { return lipgloss.NewStyle().Width(8).MaxWidth(8).Render(s) }
+		colCWD := func(s string) string { return lipgloss.NewStyle().Width(24).MaxWidth(24).Render(s) }
+		colPID := func(s string) string { return lipgloss.NewStyle().Width(7).MaxWidth(7).Render(s) }
+		colAge := func(s string) string { return lipgloss.NewStyle().Width(10).MaxWidth(10).Render(s) }
+
 		// Column headers
-		hdr := fmt.Sprintf("  %-8s  %-36s  %-8s  %-10s  %s",
-			"SESSION", "CWD", "PID", "AGE", "STATUS")
+		hdr := "  " + colSID("SESSION") + "  " + colCWD("CWD") + "  " + colPID("PID") + "  " + colAge("AGE") + "  " + "STATUS"
 		body.WriteString(DimStyle.Render(hdr))
 		body.WriteString("\n")
 		body.WriteString(DimStyle.Render("  " + strings.Repeat("─", inner-2)))
 		body.WriteString("\n")
 
 		for i, s := range m.sessions {
-			cursorStr := "  "
-			if i == m.cursor {
-				cursorStr = WarnStyle.Render("❯ ")
-			}
 			sid := s.SessionID
 			if len(sid) > 8 {
 				sid = sid[:8]
 			}
-			cwd := s.Cwd
-			if len(cwd) > 36 {
-				cwd = "…" + cwd[len(cwd)-35:]
+			// Show only the directory basename for clarity
+			cwd := filepath.Base(s.Cwd)
+			if len(cwd) > 24 {
+				cwd = cwd[:23] + "…"
 			}
 			age := fmtAge(s.UpdatedAt)
 			pidStr := "—"
@@ -182,21 +186,17 @@ func (m SelectorModel) View() string {
 			}
 
 			if i == m.cursor {
-				line := " ❯ " + SelectedStyle.Render(fmt.Sprintf(
-					" %-8s  %-36s  %-8s  %-10s  ",
-					sid, s.Cwd, pidStr, age,
-				)) + statusStr
-				body.WriteString(line)
+				body.WriteString(" ❯ " + SelectedStyle.Render(
+					colSID(sid)+"  "+colCWD(cwd)+"  "+colPID(pidStr)+"  "+colAge(age)+"  ",
+				) + statusStr)
 			} else {
-				line := fmt.Sprintf("%s%-8s  %-36s  %-8s  %-10s  %s",
-					cursorStr,
-					TitleStyle.Render(sid),
-					TextStyle.Render(cwd),
-					PIDStyle.Render(pidStr),
-					MutedStyle.Render(age),
+				body.WriteString("  " +
+					TitleStyle.Render(colSID(sid)) + "  " +
+					TextStyle.Render(colCWD(cwd)) + "  " +
+					PIDStyle.Render(colPID(pidStr)) + "  " +
+					MutedStyle.Render(colAge(age)) + "  " +
 					statusStr,
 				)
-				body.WriteString(line)
 			}
 			body.WriteString("\n")
 		}
