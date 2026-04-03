@@ -20,6 +20,7 @@ const debounceDuration = 300 * time.Millisecond
 // ReasoningMsg carries a new reasoning text detected from events.jsonl
 type ReasoningMsg struct {
 	SessionID     string
+	TurnID        string
 	UserMessage   string
 	ReasoningText string
 	ContentText   string // non-reasoning AI response content

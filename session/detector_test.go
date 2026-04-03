@@ -28,6 +28,17 @@ func usePIDAlive(t *testing.T, fn func(int) bool) {
 	})
 }
 
+func useEditorStorageRoots(t *testing.T, roots []EditorStorageRoot) {
+	t.Helper()
+	prev := editorStorageRootsFn
+	editorStorageRootsFn = func() ([]EditorStorageRoot, error) {
+		return roots, nil
+	}
+	t.Cleanup(func() {
+		editorStorageRootsFn = prev
+	})
+}
+
 func writeSessionFixture(t *testing.T, stateDir, sessionID string, updatedAt time.Time, lockPIDs ...int) {
 	t.Helper()
 	sessionDir := filepath.Join(stateDir, sessionID)
@@ -146,6 +157,7 @@ func TestDetectSortsActiveSessionsFirst(t *testing.T) {
 	usePIDAlive(t, func(pid int) bool {
 		return pid == 101 || pid == 301
 	})
+	useEditorStorageRoots(t, nil)
 
 	writeSessionFixture(t, stateDir, "session-old-active", time.Date(2026, 4, 1, 9, 0, 0, 0, time.UTC), 101)
 	writeSessionFixture(t, stateDir, "session-new-inactive", time.Date(2026, 4, 3, 9, 0, 0, 0, time.UTC), 201)
@@ -182,6 +194,7 @@ func TestDetectSortsActiveSessionsFirst(t *testing.T) {
 func TestLoadAllSessionsSortsNewestFirst(t *testing.T) {
 	stateDir := t.TempDir()
 	useSessionStatePath(t, stateDir)
+	useEditorStorageRoots(t, nil)
 
 	writeSessionFixture(t, stateDir, "session-old", time.Date(2026, 4, 1, 9, 0, 0, 0, time.UTC))
 	writeSessionFixture(t, stateDir, "session-new", time.Date(2026, 4, 3, 9, 0, 0, 0, time.UTC))

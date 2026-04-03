@@ -84,7 +84,7 @@ func (m SelectorModel) visibleSessionWindow() (start, end int) {
 func (m *SelectorModel) applySessions(sessions []session.SessionInfo) {
 	selectedID := ""
 	if m.cursor >= 0 && m.cursor < len(m.sessions) {
-		selectedID = m.sessions[m.cursor].SessionID
+		selectedID = m.sessions[m.cursor].SelectionKey()
 	}
 
 	m.sessions = sessions
@@ -97,7 +97,7 @@ func (m *SelectorModel) applySessions(sessions []session.SessionInfo) {
 
 	if selectedID != "" {
 		for i, s := range m.sessions {
-			if s.SessionID == selectedID {
+			if s.SelectionKey() == selectedID {
 				m.cursor = i
 				return
 			}
@@ -195,7 +195,7 @@ func (m SelectorModel) View() string {
 	var sb strings.Builder
 
 	// ── Header bar ──────────────────────────────────────────────────
-	title := "  copilot-watcher  │  GitHub Copilot CLI Thought Monitor  "
+	title := "  copilot-watcher  │  Local Copilot Session Monitor  "
 	sb.WriteString(HeaderStyle.Width(w).Render(title))
 	sb.WriteString("\n\n")
 
@@ -207,19 +207,20 @@ func (m SelectorModel) View() string {
 	} else if m.err != nil {
 		bodyLines = append(bodyLines, ErrorStyle.Render(fmt.Sprintf("  ✗ Error: %v", m.err)))
 	} else if len(m.sessions) == 0 {
-		bodyLines = append(bodyLines, WarnStyle.Render("  No Copilot CLI sessions found."))
-		bodyLines = append(bodyLines, MutedStyle.Render("  Sessions appear after the first message is sent in Copilot CLI."))
-		bodyLines = append(bodyLines, MutedStyle.Render("  Watching ~\\.copilot\\session-state for new sessions."))
+		bodyLines = append(bodyLines, WarnStyle.Render("  No local Copilot sessions found."))
+		bodyLines = append(bodyLines, MutedStyle.Render("  Sessions appear after the first message is sent in Copilot CLI or VS Code chat."))
+		bodyLines = append(bodyLines, MutedStyle.Render("  Watching local Copilot CLI and VS Code storage for new sessions."))
 		bodyLines = append(bodyLines, MutedStyle.Render("  Press [r] to refresh."))
 	} else {
 		// Fixed-width column helpers using lipgloss to avoid ANSI-length issues
 		colSID := func(s string) string { return lipgloss.NewStyle().Width(8).MaxWidth(8).Render(s) }
-		colCWD := func(s string) string { return lipgloss.NewStyle().Width(24).MaxWidth(24).Render(s) }
+		colSRC := func(s string) string { return lipgloss.NewStyle().Width(10).MaxWidth(10).Render(s) }
+		colCWD := func(s string) string { return lipgloss.NewStyle().Width(20).MaxWidth(20).Render(s) }
 		colPID := func(s string) string { return lipgloss.NewStyle().Width(7).MaxWidth(7).Render(s) }
 		colAge := func(s string) string { return lipgloss.NewStyle().Width(10).MaxWidth(10).Render(s) }
 
 		// Column headers
-		hdr := "  " + colSID("SESSION") + "  " + colCWD("CWD") + "  " + colPID("PID") + "  " + colAge("AGE") + "  " + "STATUS"
+		hdr := "  " + colSID("SESSION") + "  " + colSRC("SOURCE") + "  " + colCWD("CWD") + "  " + colPID("PID") + "  " + colAge("AGE") + "  " + "STATUS"
 		bodyLines = append(bodyLines, DimStyle.Render(hdr))
 		bodyLines = append(bodyLines, DimStyle.Render("  "+strings.Repeat("─", inner-2)))
 
@@ -232,8 +233,12 @@ func (m SelectorModel) View() string {
 			}
 			// Show only the directory basename for clarity
 			cwd := filepath.Base(s.Cwd)
-			if len(cwd) > 24 {
-				cwd = cwd[:23] + "…"
+			if len(cwd) > 20 {
+				cwd = cwd[:19] + "…"
+			}
+			source := s.DisplaySource()
+			if len(source) > 10 {
+				source = source[:10]
 			}
 			age := fmtAge(s.UpdatedAt)
 			pidStr := "—"
@@ -243,6 +248,8 @@ func (m SelectorModel) View() string {
 			var statusStr string
 			if s.Active {
 				statusStr = ActiveStyle.Render("● active")
+			} else if s.Source == session.SessionSourceVSCode {
+				statusStr = MutedStyle.Render("◌ stored")
 			} else {
 				statusStr = MutedStyle.Render("○ inactive")
 			}
@@ -251,11 +258,12 @@ func (m SelectorModel) View() string {
 			if i == m.cursor {
 				marker = "> "
 				bodyLines = append(bodyLines, marker+SelectedStyle.Render(
-					colSID(sid)+"  "+colCWD(cwd)+"  "+colPID(pidStr)+"  "+colAge(age)+"  ",
+					colSID(sid)+"  "+colSRC(source)+"  "+colCWD(cwd)+"  "+colPID(pidStr)+"  "+colAge(age)+"  ",
 				)+statusStr)
 			} else {
 				bodyLines = append(bodyLines, marker+
 					TitleStyle.Render(colSID(sid))+"  "+
+					MutedStyle.Render(colSRC(source))+"  "+
 					TextStyle.Render(colCWD(cwd))+"  "+
 					PIDStyle.Render(colPID(pidStr))+"  "+
 					MutedStyle.Render(colAge(age))+"  "+

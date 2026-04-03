@@ -83,6 +83,7 @@ type WatcherDebugMsg struct{ Text string }
 
 type viewTurn struct {
 	turnNum     int
+	turnID      string
 	label       string // for history tabs: session identifier / session summary label
 	userMsg     string
 	reasoning   string // AI internal reasoning text
@@ -97,6 +98,18 @@ type viewTurn struct {
 }
 
 func (t *viewTurn) translationStr() string { return t.translation.String() }
+
+func findTurnByID(turns []*viewTurn, turnID string) int {
+	if turnID == "" {
+		return -1
+	}
+	for i := len(turns) - 1; i >= 0; i-- {
+		if turns[i].turnID == turnID {
+			return i
+		}
+	}
+	return -1
+}
 
 // ── ViewerModel ────────────────────────────────────────────────────────────────
 
@@ -143,7 +156,7 @@ type ViewerModel struct {
 
 	spinnerTick int
 
-	watcher *session.Watcher
+	watcher session.LiveWatcher
 }
 
 func NewViewerModel(info session.SessionInfo, trans *translator.Translator) ViewerModel {
@@ -216,7 +229,7 @@ func (m *ViewerModel) scrollToLatest() {
 
 func (m ViewerModel) Init() tea.Cmd {
 	return tea.Batch(
-		loadHistoryCmd(m.info.EventsPath),
+		loadHistoryCmd(m.info),
 		func() tea.Msg {
 			return InitStepMsg{Step: "Session selected: " + m.info.SessionID[:8], OK: true}
 		},
@@ -226,17 +239,17 @@ func (m ViewerModel) Init() tea.Cmd {
 
 // ── Async load commands ────────────────────────────────────────────────────────
 
-func loadHistoryCmd(path string) tea.Cmd {
+func loadHistoryCmd(info session.SessionInfo) tea.Cmd {
 	return func() tea.Msg {
-		turns, err := session.LoadHistory(path)
+		turns, err := session.LoadSessionHistory(info)
 		return HistoryLoadedMsg{Turns: turns, Err: err}
 	}
 }
 
 // loadHistorySessionsCmd loads individual turns from the current session only.
-func loadHistorySessionsCmd(eventsPath string) tea.Cmd {
+func loadHistorySessionsCmd(info session.SessionInfo) tea.Cmd {
 	return func() tea.Msg {
-		turns, err := session.LoadHistory(eventsPath)
+		turns, err := session.LoadSessionHistory(info)
 		if err != nil {
 			return HSLoadedMsg{Err: err}
 		}
@@ -246,7 +259,7 @@ func loadHistorySessionsCmd(eventsPath string) tea.Cmd {
 
 func loadSessionAllCmd(info session.SessionInfo) tea.Cmd {
 	return func() tea.Msg {
-		turns, err := session.LoadHistory(info.EventsPath)
+		turns, err := session.LoadSessionHistory(info)
 		if err != nil {
 			return HALoadedMsg{Err: err}
 		}
@@ -458,6 +471,98 @@ func (m *ViewerModel) startHA() tea.Cmd {
 	return tea.Batch(waitForHAChunk(ch), spinnerCmd())
 }
 
+func newLiveTurn(turnNum int, msg ReasoningDetectedMsg, liveOpen bool) *viewTurn {
+	vt := &viewTurn{
+		turnNum:     turnNum,
+		turnID:      msg.TurnID,
+		userMsg:     msg.UserMessage,
+		reasoning:   msg.ReasoningText,
+		response:    msg.ContentText,
+		isReasoning: msg.ReasoningText != "",
+		done:        !liveOpen && msg.ReasoningText == "",
+		liveOpen:    liveOpen,
+		timestamp:   msg.Timestamp,
+	}
+	return vt
+}
+
+func applyPartialToTurn(t *viewTurn, msg ReasoningDetectedMsg) bool {
+	reasoningChanged := false
+	if msg.TurnID != "" {
+		t.turnID = msg.TurnID
+	}
+	if msg.UserMessage != "" {
+		t.userMsg = msg.UserMessage
+	}
+	if !msg.Timestamp.IsZero() {
+		t.timestamp = msg.Timestamp
+	}
+	if msg.ReasoningText != "" {
+		t.reasoning += msg.ReasoningText
+		reasoningChanged = true
+	}
+	if msg.ContentText != "" {
+		t.response += msg.ContentText
+	}
+	t.isReasoning = t.reasoning != ""
+	t.liveOpen = true
+	t.done = false
+	return reasoningChanged
+}
+
+func applyFinalToTurn(t *viewTurn, msg ReasoningDetectedMsg) bool {
+	reasoningChanged := false
+	if msg.TurnID != "" {
+		t.turnID = msg.TurnID
+	}
+	if msg.UserMessage != "" {
+		t.userMsg = msg.UserMessage
+	}
+	if !msg.Timestamp.IsZero() {
+		t.timestamp = msg.Timestamp
+	}
+	if msg.ReasoningText != "" && msg.ReasoningText != t.reasoning {
+		t.reasoning = msg.ReasoningText
+		reasoningChanged = true
+	}
+	if msg.ContentText != "" {
+		t.response = msg.ContentText
+	}
+	t.isReasoning = t.reasoning != ""
+	t.liveOpen = false
+	return reasoningChanged
+}
+
+func (m *ViewerModel) findRTTurn(msg ReasoningDetectedMsg) int {
+	if idx := findTurnByID(m.rtTurns, msg.TurnID); idx >= 0 {
+		return idx
+	}
+	for i := len(m.rtTurns) - 1; i >= 0; i-- {
+		if m.rtTurns[i].userMsg == msg.UserMessage && m.rtTurns[i].liveOpen {
+			return i
+		}
+	}
+	return -1
+}
+
+func (m *ViewerModel) upsertHistoryTurn(msg ReasoningDetectedMsg) (int, bool) {
+	if idx := findTurnByID(m.hsTurns, msg.TurnID); idx >= 0 {
+		t := m.hsTurns[idx]
+		applyFinalToTurn(t, msg)
+		if !t.isReasoning {
+			t.done = true
+		}
+		return idx, false
+	}
+
+	vt := newLiveTurn(len(m.hsTurns)+1, msg, false)
+	if !vt.isReasoning {
+		vt.done = true
+	}
+	m.hsTurns = append(m.hsTurns, vt)
+	return len(m.hsTurns) - 1, true
+}
+
 // ── Update ─────────────────────────────────────────────────────────────────────
 
 func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
@@ -528,7 +633,7 @@ func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
 		if msg.Err != nil {
 			n = 0
 		}
-		m.debugLog = append(m.debugLog, dbgf("HISTORY loaded %d turns from events.jsonl", n))
+		m.debugLog = append(m.debugLog, dbgf("HISTORY loaded %d turns from %s", n, m.info.DisplaySource()))
 		if msg.Err == nil && len(msg.Turns) > 0 {
 			// Populate Requests tab (hsTurns) from history.
 			// RT tab (rtTurns) is only populated from live watcher events.
@@ -537,6 +642,7 @@ func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
 			for i, t := range msg.Turns {
 				vt := &viewTurn{
 					turnNum:     i + 1,
+					turnID:      t.ID,
 					userMsg:     t.UserMessage,
 					reasoning:   t.ReasoningText,
 					response:    t.Response,
@@ -567,71 +673,46 @@ func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
 			if m.watcher != nil {
 				cmds = append(cmds, waitForReasoning(m.watcher.Chan()))
 			}
-			// Find existing open turn with same userMsg
-			foundIdx := -1
-			for i := len(m.rtTurns) - 1; i >= 0; i-- {
-				if m.rtTurns[i].userMsg == msg.UserMessage && m.rtTurns[i].liveOpen {
-					foundIdx = i
-					break
-				}
-			}
+			foundIdx := m.findRTTurn(msg)
 			if foundIdx >= 0 {
-				// Append to existing open turn and re-queue for translation
 				t := m.rtTurns[foundIdx]
-				if t.translating && m.rtCancel != nil {
+				reasoningChanged := msg.ReasoningText != ""
+				if reasoningChanged && t.translating && m.rtCancel != nil {
 					m.rtCancel()
 				}
-				t.translating = false
-				t.done = false
-				t.errMsg = ""
-				t.translation.Reset()
-				t.reasoning += msg.ReasoningText
-				m.rtQ = append([]int{foundIdx}, m.rtQ...)
-				cmds = append(cmds, m.startNextRT())
-			} else {
-				// Create new open partial turn
-				vt := &viewTurn{
-					turnNum:     len(m.rtTurns) + 1,
-					userMsg:     msg.UserMessage,
-					reasoning:   msg.ReasoningText,
-					isReasoning: true,
-					done:        false,
-					liveOpen:    true,
-					timestamp:   msg.Timestamp,
+				if reasoningChanged {
+					t.translating = false
+					t.done = false
+					t.errMsg = ""
+					t.translation.Reset()
 				}
+				applyPartialToTurn(t, msg)
+				if t.reasoning != "" && reasoningChanged {
+					m.rtQ = append([]int{foundIdx}, m.rtQ...)
+					cmds = append(cmds, m.startNextRT())
+				}
+			} else {
+				vt := newLiveTurn(len(m.rtTurns)+1, msg, true)
 				m.rtTurns = append(m.rtTurns, vt)
 				idx := len(m.rtTurns) - 1
-				m.rtQ = append([]int{idx}, m.rtQ...)
-				cmds = append(cmds, m.startNextRT())
+				if vt.isReasoning {
+					m.rtQ = append([]int{idx}, m.rtQ...)
+					cmds = append(cmds, m.startNextRT())
+				}
 			}
-			m.debugLog = append(m.debugLog, dbgf("RT partial snippet detected (%d chars)", len(msg.ReasoningText)))
+			m.debugLog = append(m.debugLog, dbgf("RT partial update detected (reasoning=%d content=%d chars)", len(msg.ReasoningText), len(msg.ContentText)))
 			return m, tea.Batch(cmds...)
 		}
 		// Partial=false: final turn_end msg
 		if m.rtStreamMode {
-			// Stream mode: finalize the open partial turn for this request.
-			foundIdx := -1
-			for i := len(m.rtTurns) - 1; i >= 0; i-- {
-				if m.rtTurns[i].userMsg == msg.UserMessage && m.rtTurns[i].liveOpen {
-					foundIdx = i
-					break
-				}
-			}
 			var cmds []tea.Cmd
 			if m.watcher != nil {
 				cmds = append(cmds, waitForReasoning(m.watcher.Chan()))
 			}
+			foundIdx := m.findRTTurn(msg)
 			if foundIdx >= 0 {
 				t := m.rtTurns[foundIdx]
-				t.liveOpen = false
-				reasoningChanged := false
-				if msg.ReasoningText != "" {
-					reasoningChanged = t.reasoning != msg.ReasoningText
-					t.reasoning = msg.ReasoningText
-				}
-				if msg.ContentText != "" {
-					t.response = msg.ContentText
-				}
+				reasoningChanged := msg.ReasoningText != "" && msg.ReasoningText != t.reasoning
 				if reasoningChanged {
 					if t.translating && m.rtCancel != nil {
 						m.rtCancel()
@@ -639,7 +720,10 @@ func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
 					t.translating = false
 					t.errMsg = ""
 					t.translation.Reset()
-					t.done = false
+				}
+				applyFinalToTurn(t, msg)
+				t.done = false
+				if reasoningChanged {
 					if t.reasoning != "" {
 						m.rtQ = append([]int{foundIdx}, m.rtQ...)
 						cmds = append(cmds, m.startNextRT())
@@ -657,14 +741,7 @@ func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
 				}
 				m.debugLog = append(m.debugLog, dbgf("RT stream turn #%d finalized", foundIdx+1))
 			} else {
-				vt := &viewTurn{
-					turnNum:     len(m.rtTurns) + 1,
-					userMsg:     msg.UserMessage,
-					reasoning:   msg.ReasoningText,
-					response:    msg.ContentText,
-					isReasoning: msg.ReasoningText != "",
-					timestamp:   msg.Timestamp,
-				}
+				vt := newLiveTurn(len(m.rtTurns)+1, msg, false)
 				if !vt.isReasoning {
 					vt.done = true
 				}
@@ -676,18 +753,10 @@ func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
 				}
 				m.debugLog = append(m.debugLog, dbgf("RT stream turn created on final event (%d chars)", len(msg.ReasoningText)))
 			}
-			// Also update hsTurns
-			hsVt := &viewTurn{
-				turnNum:     len(m.hsTurns) + 1,
-				userMsg:     msg.UserMessage,
-				reasoning:   msg.ReasoningText,
-				response:    msg.ContentText,
-				isReasoning: msg.ReasoningText != "",
-				timestamp:   msg.Timestamp,
-			}
-			m.hsTurns = append(m.hsTurns, hsVt)
-			hsIdx := len(m.hsTurns) - 1
+			hsIdx, _ := m.upsertHistoryTurn(msg)
+			hsVt := m.hsTurns[hsIdx]
 			if hsVt.isReasoning {
+				hsVt.done = false
 				m.hsQ = append([]int{hsIdx}, m.hsQ...)
 			} else {
 				hsVt.done = true
@@ -698,14 +767,7 @@ func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
 			return m, tea.Batch(cmds...)
 		}
 		// Turn mode (default): existing behavior
-		vt := &viewTurn{
-			turnNum:     len(m.rtTurns) + 1,
-			userMsg:     msg.UserMessage,
-			reasoning:   msg.ReasoningText,
-			response:    msg.ContentText,
-			isReasoning: msg.ReasoningText != "",
-			timestamp:   msg.Timestamp,
-		}
+		vt := newLiveTurn(len(m.rtTurns)+1, msg, false)
 		m.rtTurns = append(m.rtTurns, vt)
 		idx := len(m.rtTurns) - 1
 		if vt.isReasoning {
@@ -716,16 +778,8 @@ func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
 		m.debugLog = append(m.debugLog, dbgf("RT turn #%d detected (reasoning=%d content=%d chars)", idx+1, len(msg.ReasoningText), len(msg.ContentText)))
 
 		// Also add to History/Turns tab so all session turns are visible there
-		hsVt := &viewTurn{
-			turnNum:     len(m.hsTurns) + 1,
-			userMsg:     msg.UserMessage,
-			reasoning:   msg.ReasoningText,
-			response:    msg.ContentText,
-			isReasoning: msg.ReasoningText != "",
-			timestamp:   msg.Timestamp,
-		}
-		m.hsTurns = append(m.hsTurns, hsVt)
-		hsIdx := len(m.hsTurns) - 1
+		hsIdx, _ := m.upsertHistoryTurn(msg)
+		hsVt := m.hsTurns[hsIdx]
 		if hsVt.isReasoning {
 			m.hsQ = append([]int{hsIdx}, m.hsQ...)
 		} else {
@@ -790,6 +844,7 @@ func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
 			for i, t := range msg.Turns {
 				vt := &viewTurn{
 					turnNum:     i + 1,
+					turnID:      t.ID,
 					userMsg:     t.UserMessage,
 					reasoning:   t.ReasoningText,
 					response:    t.Response,
@@ -1011,7 +1066,7 @@ func (m ViewerModel) View() string {
 	if lipgloss.Width(cwd) > maxCwd {
 		cwd = "…" + string([]rune(cwd)[len([]rune(cwd))-maxCwd+1:])
 	}
-	leftStr := fmt.Sprintf("  copilot-watcher  │  %s  %s  │  %s / %s  ", sid, cwd, m.outputLang, fmtShort(m.outputFormat))
+	leftStr := fmt.Sprintf("  copilot-watcher  │  %s  %s  │  %s  │  %s / %s  ", sid, cwd, m.info.DisplaySource(), m.outputLang, fmtShort(m.outputFormat))
 	dot := StatusDot(m.statusOK)
 	statusStr := m.status
 	if lipgloss.Width(statusStr) > 30 {
@@ -1161,12 +1216,16 @@ func (m ViewerModel) buildRTLines(w int) []string {
 		if m.rtStreamMode {
 			modeLine = MutedStyle.Render("  Mode: [m] streaming (live)")
 		}
+		waitingLabel := fmt.Sprintf("  Waiting for %s session updates...", m.info.DisplaySource())
+		if m.info.Source == session.SessionSourceCLI {
+			waitingLabel = "  Waiting for Copilot CLI to produce reasoning output..."
+		}
 		return []string{
 			"",
-			WarnStyle.Render("  Waiting for Copilot CLI to produce reasoning output..."),
+			WarnStyle.Render(waitingLabel),
 			modeLine,
 			MutedStyle.Render("  Press [m] to switch modes while waiting."),
-			MutedStyle.Render("  (New reasoning steps will appear here as Copilot processes requests)"),
+			MutedStyle.Render("  (New reasoning or response updates will appear here while the session is running)"),
 			"",
 		}
 	}
@@ -1221,6 +1280,9 @@ func (m ViewerModel) buildHALines(w int) []string {
 }
 
 func sessionSummaryLabel(info session.SessionInfo) string {
+	if strings.TrimSpace(info.Summary) != "" {
+		return info.Summary
+	}
 	sid := info.SessionID
 	if len(sid) > 8 {
 		sid = sid[:8]
@@ -1353,6 +1415,11 @@ func buildTurnBlock(t *viewTurn, w int, spinTick int) []string {
 	if t.isReasoning {
 		// Reasoning turn: full translated block in gray
 		lines = append(lines, buildReasoningLines(t, textMaxW, spinTick)...)
+		if t.response != "" {
+			lines = append(lines, "")
+			lines = append(lines, MutedStyle.Render("  Response"))
+			lines = append(lines, buildResponseLines(t, textMaxW)...)
+		}
 	} else {
 		// Content-only turn: compact response display
 		lines = append(lines, buildResponseLines(t, textMaxW)...)

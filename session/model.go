@@ -5,6 +5,22 @@ import (
 	"time"
 )
 
+type SessionSource string
+
+const (
+	SessionSourceCLI    SessionSource = "cli"
+	SessionSourceVSCode SessionSource = "vscode"
+)
+
+type SessionFormat string
+
+const (
+	SessionFormatCLIEventsJSONL    SessionFormat = "cli-events-jsonl"
+	SessionFormatVSCodeChatJSON    SessionFormat = "vscode-chat-json"
+	SessionFormatVSCodeChatJSONL   SessionFormat = "vscode-chat-jsonl"
+	SessionFormatVSCodeLegacyState SessionFormat = "vscode-legacy-state"
+)
+
 // SessionEvent represents a single event in events.jsonl
 type SessionEvent struct {
 	Type      string          `json:"type"`
@@ -47,23 +63,54 @@ type WorkspaceConfig struct {
 
 // SessionInfo represents a detected Copilot CLI session (active or inactive)
 type SessionInfo struct {
-	SessionID  string
-	Active     bool // true if the session process is currently running
-	PID        int  // non-zero only when Active==true
-	Cwd        string
-	Summary    string
-	CreatedAt  time.Time
-	UpdatedAt  time.Time
-	EventsPath string
+	SessionID    string
+	Source       SessionSource
+	SourceLabel  string
+	Format       SessionFormat
+	Active       bool // true if the session process is currently running
+	PID          int  // non-zero only when Active==true
+	Cwd          string
+	Summary      string
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
+	EventsPath   string
+	HistoryPath  string
+	LivePath     string
+	WorkspaceID  string
+	StorageRoot  string
+	MetadataPath string
 }
 
 // Turn represents a single user+assistant exchange
 type Turn struct {
+	ID            string
 	UserMessage   string
 	ReasoningText string
 	Response      string
 	Translation   string // AI translation (populated later)
 	Timestamp     time.Time
+}
+
+func (s SessionInfo) DisplaySource() string {
+	if s.SourceLabel != "" {
+		return s.SourceLabel
+	}
+	switch s.Source {
+	case SessionSourceCLI:
+		return "CLI"
+	case SessionSourceVSCode:
+		return "VS Code"
+	default:
+		return "Unknown"
+	}
+}
+
+func (s SessionInfo) SelectionKey() string {
+	return string(s.Source) + "|" + s.SessionID + "|" + s.HistoryPath + "|" + s.EventsPath
+}
+
+func (s SessionInfo) SupportsLive() bool {
+	return s.LivePath != ""
 }
 
 // ParseAssistantMessage decodes AssistantMessageData from a raw SessionEvent

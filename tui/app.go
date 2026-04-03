@@ -50,7 +50,7 @@ type sdkRetryMsg struct{}
 
 // viewerReadyMsg is sent when the viewer's watchers are started.
 type viewerReadyMsg struct {
-	watcher *session.Watcher
+	watcher session.LiveWatcher
 	steps   []InitStepMsg
 }
 
@@ -87,14 +87,21 @@ func startViewerCmd(info session.SessionInfo, trans *translator.Translator) tea.
 	return func() tea.Msg {
 		var steps []InitStepMsg
 
-		// Start JSONL watcher
-		var watcher *session.Watcher
-		w := session.NewWatcher(info.SessionID, info.EventsPath)
-		if err := w.Start(); err != nil {
-			steps = append(steps, InitStepMsg{Step: "JSONL watcher", Err: err})
-		} else {
+		var watcher session.LiveWatcher
+		w, err := session.NewLiveWatcher(info)
+		if err != nil {
+			steps = append(steps, InitStepMsg{Step: "Live watcher", Err: err})
+		} else if w != nil {
 			watcher = w
-			steps = append(steps, InitStepMsg{Step: "JSONL watcher started (events.jsonl)", OK: true})
+			label := "Live watcher started"
+			if info.Source == session.SessionSourceCLI {
+				label = "CLI watcher started (events.jsonl)"
+			} else if info.Source == session.SessionSourceVSCode {
+				label = "VS Code session watcher started"
+			}
+			steps = append(steps, InitStepMsg{Step: label, OK: true})
+		} else {
+			steps = append(steps, InitStepMsg{Step: "Live watcher unavailable for this session", OK: true})
 		}
 
 		return viewerReadyMsg{watcher: watcher, steps: steps}
@@ -346,7 +353,7 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, m.viewer.WatchChannels())
 			// If defaulting to history-sessions, trigger initial load
 			if m.viewer.activeTab == TabHistorySessions {
-				cmds = append(cmds, loadHistorySessionsCmd(m.viewer.info.EventsPath))
+				cmds = append(cmds, loadHistorySessionsCmd(m.viewer.info))
 			}
 		}
 		return m, tea.Batch(cmds...)
@@ -434,7 +441,7 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if msg.String() == "r" {
 				m.viewer.rtTurns = nil
 				m.viewer.rtQ = nil
-				return m, loadHistoryCmd(m.viewer.info.EventsPath)
+				return m, loadHistoryCmd(m.viewer.info)
 			}
 			updated, cmd := m.viewer.Update(msg)
 			m.viewer = &updated

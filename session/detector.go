@@ -41,10 +41,40 @@ func sessionStatePath() (string, error) {
 	return filepath.Join(rootDir, sessionStateDirName), nil
 }
 
-// Detect scans ~/.copilot/session-state for all Copilot CLI sessions.
-// Sessions with a live process are marked Active=true; others are included too
-// so the user can browse history even when Copilot CLI is not running.
+// Detect scans all supported local session stores and returns the merged list.
 func Detect() ([]SessionInfo, error) {
+	var sessions []SessionInfo
+	var detectErr error
+
+	cliSessions, err := detectCLISessions()
+	if err != nil {
+		detectErr = err
+	}
+	sessions = append(sessions, cliSessions...)
+
+	vscodeSessions, err := detectVSCodeSessions()
+	if err != nil && detectErr == nil {
+		detectErr = err
+	}
+	sessions = append(sessions, vscodeSessions...)
+
+	// Sort: active first, then by most recently updated
+	sort.Slice(sessions, func(i, j int) bool {
+		if sessions[i].Active != sessions[j].Active {
+			return sessions[i].Active
+		}
+		if sessions[i].UpdatedAt.Equal(sessions[j].UpdatedAt) {
+			return sessions[i].SelectionKey() < sessions[j].SelectionKey()
+		}
+		return sessions[i].UpdatedAt.After(sessions[j].UpdatedAt)
+	})
+	if len(sessions) > 0 {
+		return sessions, nil
+	}
+	return sessions, detectErr
+}
+
+func detectCLISessions() ([]SessionInfo, error) {
 	stateDir, err := sessionStatePathFn()
 	if err != nil {
 		return nil, err
@@ -67,24 +97,16 @@ func Detect() ([]SessionInfo, error) {
 			continue
 		}
 		sessionDir := filepath.Join(stateDir, entry.Name())
-		info, err := parseSession(sessionDir, entry.Name())
+		info, err := parseCLISession(sessionDir, entry.Name())
 		if err != nil || info == nil {
 			continue
 		}
 		sessions = append(sessions, *info)
 	}
-
-	// Sort: active first, then by most recently updated
-	sort.Slice(sessions, func(i, j int) bool {
-		if sessions[i].Active != sessions[j].Active {
-			return sessions[i].Active
-		}
-		return sessions[i].UpdatedAt.After(sessions[j].UpdatedAt)
-	})
 	return sessions, nil
 }
 
-func parseSession(sessionDir, sessionID string) (*SessionInfo, error) {
+func parseCLISession(sessionDir, sessionID string) (*SessionInfo, error) {
 	// Must have events.jsonl to be useful
 	eventsPath := filepath.Join(sessionDir, "events.jsonl")
 	if _, err := os.Stat(eventsPath); err != nil {
@@ -97,12 +119,20 @@ func parseSession(sessionDir, sessionID string) (*SessionInfo, error) {
 	}
 
 	info := &SessionInfo{
-		SessionID:  sessionID,
-		Cwd:        ws.Cwd,
-		Summary:    ws.Summary,
-		CreatedAt:  ws.CreatedAt,
-		UpdatedAt:  ws.UpdatedAt,
-		EventsPath: eventsPath,
+		SessionID:    sessionID,
+		Source:       SessionSourceCLI,
+		SourceLabel:  "CLI",
+		Format:       SessionFormatCLIEventsJSONL,
+		Cwd:          ws.Cwd,
+		Summary:      ws.Summary,
+		CreatedAt:    ws.CreatedAt,
+		UpdatedAt:    ws.UpdatedAt,
+		EventsPath:   eventsPath,
+		HistoryPath:  eventsPath,
+		LivePath:     eventsPath,
+		WorkspaceID:  sessionID,
+		StorageRoot:  sessionDir,
+		MetadataPath: filepath.Join(sessionDir, "workspace.yaml"),
 	}
 
 	// Check whether a live process holds a lock on this session
@@ -158,48 +188,14 @@ func isPIDAlive(pid int) bool {
 
 // LoadAllSessions returns all sessions regardless of active status, sorted newest first.
 func LoadAllSessions() ([]SessionInfo, error) {
-	stateDir, err := sessionStatePathFn()
-	if err != nil {
+	sessions, err := Detect()
+	if err != nil && len(sessions) == 0 {
 		return nil, err
-	}
-	entries, err := os.ReadDir(stateDir)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
-		return nil, err
-	}
-	var sessions []SessionInfo
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-		// Skip copilot-watcher's own internal translation sessions
-		if strings.HasPrefix(entry.Name(), "copilot-watcher-") {
-			continue
-		}
-		sessionDir := filepath.Join(stateDir, entry.Name())
-		sessionID := entry.Name()
-		eventsPath := filepath.Join(sessionDir, "events.jsonl")
-		if _, err := os.Stat(eventsPath); err != nil {
-			continue
-		}
-		wsPath := filepath.Join(sessionDir, "workspace.yaml")
-		ws, err := readWorkspaceConfig(wsPath)
-		if err != nil {
-			ws = &WorkspaceConfig{ID: sessionID, Cwd: "unknown"}
-		}
-		sessions = append(sessions, SessionInfo{
-			SessionID:  sessionID,
-			PID:        0,
-			Cwd:        ws.Cwd,
-			Summary:    ws.Summary,
-			CreatedAt:  ws.CreatedAt,
-			UpdatedAt:  ws.UpdatedAt,
-			EventsPath: eventsPath,
-		})
 	}
 	sort.Slice(sessions, func(i, j int) bool {
+		if sessions[i].UpdatedAt.Equal(sessions[j].UpdatedAt) {
+			return sessions[i].SelectionKey() < sessions[j].SelectionKey()
+		}
 		return sessions[i].UpdatedAt.After(sessions[j].UpdatedAt)
 	})
 	return sessions, nil
@@ -233,6 +229,7 @@ func LoadHistory(eventsPath string) ([]Turn, error) {
 			// Start of new turn
 			if currentUser != "" && (currentReasoning != "" || currentContent != "") {
 				turns = append(turns, Turn{
+					ID:            "",
 					UserMessage:   currentUser,
 					ReasoningText: currentReasoning,
 					Response:      currentContent,
@@ -260,6 +257,7 @@ func LoadHistory(eventsPath string) ([]Turn, error) {
 			// Finalize turn when any assistant output was found
 			if currentUser != "" && (currentReasoning != "" || currentContent != "") {
 				turns = append(turns, Turn{
+					ID:            "",
 					UserMessage:   currentUser,
 					ReasoningText: currentReasoning,
 					Response:      currentContent,
@@ -273,6 +271,7 @@ func LoadHistory(eventsPath string) ([]Turn, error) {
 	}
 	if currentUser != "" && (currentReasoning != "" || currentContent != "") {
 		turns = append(turns, Turn{
+			ID:            "",
 			UserMessage:   currentUser,
 			ReasoningText: currentReasoning,
 			Response:      currentContent,
