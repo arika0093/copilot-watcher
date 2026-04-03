@@ -202,11 +202,15 @@ func (m ViewerModel) contentHeight() int {
 	if h <= 0 {
 		h = 40
 	}
-	contentH := h - 5
+	contentH := h - m.headerHeight() - 4
 	if contentH < 3 {
 		contentH = 3
 	}
 	return contentH
+}
+
+func (m ViewerModel) headerHeight() int {
+	return len(m.buildHeaderLines(m.width))
 }
 
 func (m ViewerModel) panelContentWidth() int {
@@ -1090,39 +1094,13 @@ func (m ViewerModel) View() string {
 	if w <= 0 {
 		w = 100
 	}
-	h := m.height
-	if h <= 0 {
-		h = 40
-	}
 
 	var sb strings.Builder
 
 	// ── Header ────────────────────────────────────────────────────────────────
-	sid := m.info.SessionID
-	if len(sid) > 8 {
-		sid = sid[:8]
-	}
-	cwd := m.info.Cwd
-	maxCwd := w - 50
-	if maxCwd < 10 {
-		maxCwd = 10
-	}
-	if lipgloss.Width(cwd) > maxCwd {
-		cwd = "…" + string([]rune(cwd)[len([]rune(cwd))-maxCwd+1:])
-	}
-	leftStr := fmt.Sprintf("  copilot-watcher  │  %s  %s  │  %s  │  %s / %s  ", sid, cwd, m.info.DisplaySource(), m.outputLang, fmtShort(m.outputFormat))
-	dot := StatusDot(m.statusOK)
-	statusStr := m.status
-	if lipgloss.Width(statusStr) > 30 {
-		statusStr = string([]rune(statusStr)[:27]) + "…"
-	}
-	rightStr := fmt.Sprintf("  %s %s  ", dot, statusStr)
-	pad := w - lipgloss.Width(leftStr) - lipgloss.Width(rightStr)
-	if pad < 0 {
-		pad = 0
-	}
-	header := HeaderStyle.Width(w).Render(leftStr + strings.Repeat(" ", pad) + rightStr)
-	sb.WriteString(header + "\n")
+	headerLines := m.buildHeaderLines(w)
+	sb.WriteString(strings.Join(headerLines, "\n"))
+	sb.WriteString("\n")
 
 	// ── Init log (shown only during initialization) ────────────────────────────
 	if !m.ready {
@@ -1174,6 +1152,62 @@ func (m ViewerModel) View() string {
 	tabBar := m.renderTabBar(w)
 	sb.WriteString(tabBar)
 	return sb.String()
+}
+
+func (m ViewerModel) buildHeaderLines(w int) []string {
+	if w <= 0 {
+		w = 100
+	}
+	innerW := w - 2
+	if innerW < 10 {
+		innerW = 10
+	}
+
+	sid := m.info.SessionID
+	if len(sid) > 8 {
+		sid = sid[:8]
+	}
+	cwd := m.info.Cwd
+	maxCwd := w - 50
+	if maxCwd < 10 {
+		maxCwd = 10
+	}
+	if lipgloss.Width(cwd) > maxCwd {
+		cwd = "…" + string([]rune(cwd)[len([]rune(cwd))-maxCwd+1:])
+	}
+
+	leftStr := fmt.Sprintf("copilot-watcher  │  %s  %s  │  %s  │  %s / %s", sid, cwd, m.info.DisplaySource(), m.outputLang, fmtShort(m.outputFormat))
+	statusStr := m.status
+	if lipgloss.Width(statusStr) > 30 {
+		statusStr = string([]rune(statusStr)[:27]) + "…"
+	}
+	rightStr := fmt.Sprintf("%s %s", StatusDot(m.statusOK), statusStr)
+
+	if lipgloss.Width(leftStr)+lipgloss.Width(rightStr)+1 <= innerW {
+		pad := innerW - lipgloss.Width(leftStr) - lipgloss.Width(rightStr)
+		return []string{HeaderStyle.Width(w).Render(leftStr + strings.Repeat(" ", pad) + rightStr)}
+	}
+
+	leftLines := wordWrapDisplay(leftStr, innerW)
+	if len(leftLines) == 0 {
+		leftLines = []string{"copilot-watcher"}
+	}
+
+	rendered := make([]string, 0, len(leftLines)+1)
+	for i := 0; i < len(leftLines)-1; i++ {
+		rendered = append(rendered, HeaderStyle.Width(w).Render(leftLines[i]))
+	}
+
+	last := leftLines[len(leftLines)-1]
+	if lipgloss.Width(last)+lipgloss.Width(rightStr)+1 <= innerW {
+		pad := innerW - lipgloss.Width(last) - lipgloss.Width(rightStr)
+		rendered = append(rendered, HeaderStyle.Width(w).Render(last+strings.Repeat(" ", pad)+rightStr))
+		return rendered
+	}
+
+	rendered = append(rendered, HeaderStyle.Width(w).Render(last))
+	rendered = append(rendered, HeaderStyle.Width(w).Render(rightStr))
+	return rendered
 }
 
 func (m ViewerModel) renderTabBar(w int) string {

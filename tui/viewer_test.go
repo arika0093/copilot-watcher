@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/copilot-watcher/copilot-watcher/session"
 )
 
 func TestVisibleLinesFromBottomPadsAndAnchorsLatest(t *testing.T) {
@@ -103,6 +105,37 @@ func TestBuildTurnBlockShowsPlaceholderWithoutResponseInRequests(t *testing.T) {
 	}
 	if !strings.Contains(joined, "No reasoning summary available") {
 		t.Fatalf("buildTurnBlock() missing placeholder: %q", joined)
+	}
+}
+
+func TestBuildHeaderLinesWrapAndViewFitsHeight(t *testing.T) {
+	m := ViewerModel{
+		info: session.SessionInfo{
+			SessionID:   "1234567890abcdef",
+			Cwd:         strings.Repeat("very-long-path/", 6),
+			SourceLabel: "VS Code",
+		},
+		status:       "Monitoring a very long status message for header wrapping",
+		statusOK:     true,
+		outputLang:   "Japanese",
+		outputFormat: "conversational",
+		ready:        true,
+		width:        50,
+		height:       12,
+		scroll:       map[TabID]int{},
+	}
+
+	headerLines := m.buildHeaderLines(m.width)
+	if len(headerLines) < 2 {
+		t.Fatalf("buildHeaderLines() = %d lines, want at least 2", len(headerLines))
+	}
+
+	viewLines := strings.Split(stripANSI(m.View()), "\n")
+	if len(viewLines) != m.height {
+		t.Fatalf("len(View lines) = %d, want %d", len(viewLines), m.height)
+	}
+	if !strings.Contains(viewLines[0], "copilot-watcher") {
+		t.Fatalf("first header line missing expected content: %q", viewLines[0])
 	}
 }
 

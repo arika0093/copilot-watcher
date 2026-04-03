@@ -11,7 +11,9 @@ func isPIDAliveWindows(pid int) bool {
 	if err != nil {
 		return false
 	}
-	defer windows.CloseHandle(handle)
+	defer func() {
+		_ = windows.CloseHandle(handle)
+	}()
 
 	var code uint32
 	if err := windows.GetExitCodeProcess(handle, &code); err != nil {

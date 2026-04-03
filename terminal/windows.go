@@ -19,7 +19,9 @@ func FindPTYMasterPath(pid int) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("OpenProcess failed: %w", err)
 	}
-	windows.CloseHandle(handle)
+	if err := windows.CloseHandle(handle); err != nil {
+		return "", fmt.Errorf("CloseHandle failed: %w", err)
+	}
 	// Return a special indicator; actual reading in Reader uses Windows Console APIs
 	return fmt.Sprintf("windows-console://%d", pid), nil
 }
@@ -39,7 +41,7 @@ func (cr *consoleReader) readConsoleOutput() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("OpenProcess: %w", err)
 	}
-	defer windows.CloseHandle(srcProcess)
+	defer closeHandleIgnoreErr(srcProcess)
 
 	// Get stdout handle of target process (handle value 7 = STD_OUTPUT_HANDLE for typical console)
 	// We use the well-known handle value approach
@@ -58,7 +60,7 @@ func (cr *consoleReader) readConsoleOutput() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("DuplicateHandle: %w", err)
 	}
-	defer windows.CloseHandle(dupHandle)
+	defer closeHandleIgnoreErr(dupHandle)
 
 	// Get console screen buffer info
 	var csbi windows.ConsoleScreenBufferInfo
@@ -91,10 +93,6 @@ func (cr *consoleReader) readConsoleOutput() (string, error) {
 
 	// Diff against previous snapshot
 	var newChars []uint16
-	minLen := len(cr.prevBuffer)
-	if minLen > int(charsRead) {
-		minLen = int(charsRead)
-	}
 	if len(cr.prevBuffer) == 0 {
 		newChars = current
 	} else if int(charsRead) > len(cr.prevBuffer) {
@@ -153,4 +151,8 @@ func readConsoleOutputCharacterW(console windows.Handle, buf *uint16, nLen uint3
 		return err
 	}
 	return nil
+}
+
+func closeHandleIgnoreErr(handle windows.Handle) {
+	_ = windows.CloseHandle(handle)
 }
