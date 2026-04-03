@@ -1,6 +1,11 @@
 package tui
 
-import "testing"
+import (
+	"regexp"
+	"strings"
+	"testing"
+	"time"
+)
 
 func TestVisibleLinesFromBottomPadsAndAnchorsLatest(t *testing.T) {
 	visible, offset, start, end := visibleLinesFromBottom([]string{"line1", "line2", "line3"}, 5, 0)
@@ -45,4 +50,63 @@ func TestVisibleLinesFromBottomClampsOverscroll(t *testing.T) {
 			t.Fatalf("visible[%d] = %q, want %q", i, visible[i], want[i])
 		}
 	}
+}
+
+func TestClampBottomOffsetForRangeShowsOlderSelection(t *testing.T) {
+	got := clampBottomOffsetForRange(20, 5, 0, 4, 8)
+	if got != 11 {
+		t.Fatalf("clampBottomOffsetForRange() = %d, want %d", got, 11)
+	}
+}
+
+func TestBuildRTLinesStacksAllTurns(t *testing.T) {
+	m := ViewerModel{
+		rtTurns: []*viewTurn{
+			{turnNum: 1, userMsg: "first request", reasoning: "first reasoning", isReasoning: true, done: true, timestamp: time.Now().Add(-2 * time.Minute)},
+			{turnNum: 2, userMsg: "second request", response: "second response", done: true, timestamp: time.Now().Add(-1 * time.Minute)},
+		},
+	}
+
+	joined := stripANSI(strings.Join(m.buildRTLines(80), "\n"))
+	for _, want := range []string{"Request 1 / 2", "Request 2 / 2", "first request", "second request", "second response"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("buildRTLines() missing %q in output: %q", want, joined)
+		}
+	}
+}
+
+func TestBuildTurnBlockOmitsResponseWhenDisabled(t *testing.T) {
+	turn := &viewTurn{
+		userMsg:     "request",
+		reasoning:   "reasoning",
+		response:    "response text",
+		isReasoning: true,
+		done:        true,
+	}
+
+	joined := stripANSI(strings.Join(buildTurnBlock(turn, 80, 0, false), "\n"))
+	if strings.Contains(joined, "Response") || strings.Contains(joined, "response text") {
+		t.Fatalf("buildTurnBlock() unexpectedly rendered response: %q", joined)
+	}
+}
+
+func TestBuildTurnBlockShowsPlaceholderWithoutResponseInRequests(t *testing.T) {
+	turn := &viewTurn{
+		userMsg:  "request",
+		response: "response text",
+		done:     true,
+	}
+
+	joined := stripANSI(strings.Join(buildTurnBlock(turn, 80, 0, false), "\n"))
+	if strings.Contains(joined, "response text") {
+		t.Fatalf("buildTurnBlock() unexpectedly rendered raw response: %q", joined)
+	}
+	if !strings.Contains(joined, "No reasoning summary available") {
+		t.Fatalf("buildTurnBlock() missing placeholder: %q", joined)
+	}
+}
+
+func stripANSI(s string) string {
+	ansi := regexp.MustCompile(`\x1b\[[0-9;]*m`)
+	return ansi.ReplaceAllString(s, "")
 }

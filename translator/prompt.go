@@ -30,10 +30,12 @@ func StripXMLTags(text string) string {
 
 // RTSystemPrompt is the system message for the real-time translation session.
 func RTSystemPrompt() string {
-	return `You are an expert translator for GitHub Copilot AI internal reasoning text.
-You receive the AI's thinking/reasoning text one turn at a time.
-Translate the text faithfully into the language and format specified in the user message.
-Preserve the original meaning. No preamble. Output only the translation.`
+	return `You are an expert translator and summarizer for GitHub Copilot live request updates.
+You receive the current user request, AI reasoning, and AI response content for one request at a time.
+Some updates are partial while the request is still running, and some are final.
+Use only the information present in the provided update.
+Follow the language and format instructions in the user message.
+No preamble. Output only the requested result.`
 }
 
 // HistSystemPrompt is the system message for the history summary session.
@@ -66,6 +68,30 @@ func FormatInstruction(format string) string {
 func TranslateUserPrompt(reasoningText, lang, format string) string {
 	return fmt.Sprintf("Language: %s\nFormat: %s\nTask: Translate the following reasoning text into the target language.\n\n%s",
 		lang, FormatInstruction(format), StripXMLTags(reasoningText))
+}
+
+// LiveRequestUserPrompt builds the user message for a live request update.
+// It can include the user request, AI reasoning, and current response content.
+func LiveRequestUserPrompt(userMsg, reasoning, response, lang, format string) string {
+	var sb strings.Builder
+	if userMsg != "" {
+		sb.WriteString("User request:\n")
+		sb.WriteString(StripXMLTags(userMsg))
+		sb.WriteString("\n\n")
+	}
+	if reasoning != "" {
+		sb.WriteString("AI internal reasoning:\n")
+		sb.WriteString(StripXMLTags(reasoning))
+		sb.WriteString("\n\n")
+	}
+	if response != "" {
+		sb.WriteString("AI response to user:\n")
+		sb.WriteString(StripXMLTags(response))
+	}
+	return fmt.Sprintf(
+		"Language: %s\nFormat: %s\nTask: Produce the current live request summary or translation using all available sections below. If the request is still in progress, reflect only what is currently known.\n\n%s",
+		lang, FormatInstruction(format), strings.TrimSpace(sb.String()),
+	)
 }
 
 // SessionSummaryUserPrompt builds the user message for a whole-session summary.

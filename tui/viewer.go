@@ -99,6 +99,30 @@ type viewTurn struct {
 
 func (t *viewTurn) translationStr() string { return t.translation.String() }
 
+func hasRTSummaryContent(t *viewTurn) bool {
+	if t == nil {
+		return false
+	}
+	return strings.TrimSpace(t.reasoning) != "" || strings.TrimSpace(t.response) != ""
+}
+
+func selectedTurnIndex(total, cursor int) int {
+	if total == 0 {
+		return -1
+	}
+	if cursor < 0 {
+		cursor = 0
+	}
+	if cursor >= total {
+		cursor = total - 1
+	}
+	idx := total - 1 - cursor
+	if idx < 0 {
+		return 0
+	}
+	return idx
+}
+
 func findTurnByID(turns []*viewTurn, turnID string) int {
 	if turnID == "" {
 		return -1
@@ -359,7 +383,13 @@ func (m *ViewerModel) startNextRT() tea.Cmd {
 			continue
 		}
 		t := m.rtTurns[idx]
-		if t.done || t.translating || t.reasoning == "" {
+		if t.done || t.translating {
+			continue
+		}
+		if !hasRTSummaryContent(t) {
+			if !t.liveOpen {
+				t.done = true
+			}
 			continue
 		}
 		if m.rtCancel != nil {
@@ -369,7 +399,7 @@ func (m *ViewerModel) startNextRT() tea.Cmd {
 		gen := m.rtGeneration
 		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 		m.rtCancel = cancel
-		ch, err := m.trans.Translate(ctx, t.reasoning)
+		ch, err := m.trans.TranslateLiveRequest(ctx, t.userMsg, t.reasoning, t.response)
 		if err != nil {
 			t.errMsg = err.Error()
 			t.translating = false
@@ -479,7 +509,7 @@ func newLiveTurn(turnNum int, msg ReasoningDetectedMsg, liveOpen bool) *viewTurn
 		reasoning:   msg.ReasoningText,
 		response:    msg.ContentText,
 		isReasoning: msg.ReasoningText != "",
-		done:        !liveOpen && msg.ReasoningText == "",
+		done:        !liveOpen && msg.ReasoningText == "" && msg.ContentText == "",
 		liveOpen:    liveOpen,
 		timestamp:   msg.Timestamp,
 	}
@@ -570,6 +600,9 @@ func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
 
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
+		if m.activeTab == TabRealtime {
+			m.ensureRTCursorVisible()
+		}
 
 	case spinnerTickMsg:
 		m.spinnerTick = (m.spinnerTick + 1) % len(SpinnerFrames)
@@ -676,18 +709,18 @@ func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
 			foundIdx := m.findRTTurn(msg)
 			if foundIdx >= 0 {
 				t := m.rtTurns[foundIdx]
-				reasoningChanged := msg.ReasoningText != ""
-				if reasoningChanged && t.translating && m.rtCancel != nil {
+				requestChanged := msg.ReasoningText != "" || msg.ContentText != ""
+				if requestChanged && t.translating && m.rtCancel != nil {
 					m.rtCancel()
 				}
-				if reasoningChanged {
+				if requestChanged {
 					t.translating = false
 					t.done = false
 					t.errMsg = ""
 					t.translation.Reset()
 				}
 				applyPartialToTurn(t, msg)
-				if t.reasoning != "" && reasoningChanged {
+				if hasRTSummaryContent(t) && requestChanged {
 					m.rtQ = append([]int{foundIdx}, m.rtQ...)
 					cmds = append(cmds, m.startNextRT())
 				}
@@ -695,10 +728,13 @@ func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
 				vt := newLiveTurn(len(m.rtTurns)+1, msg, true)
 				m.rtTurns = append(m.rtTurns, vt)
 				idx := len(m.rtTurns) - 1
-				if vt.isReasoning {
+				if hasRTSummaryContent(vt) {
 					m.rtQ = append([]int{idx}, m.rtQ...)
 					cmds = append(cmds, m.startNextRT())
 				}
+			}
+			if m.activeTab == TabRealtime {
+				m.ensureRTCursorVisible()
 			}
 			m.debugLog = append(m.debugLog, dbgf("RT partial update detected (reasoning=%d content=%d chars)", len(msg.ReasoningText), len(msg.ContentText)))
 			return m, tea.Batch(cmds...)
@@ -712,8 +748,9 @@ func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
 			foundIdx := m.findRTTurn(msg)
 			if foundIdx >= 0 {
 				t := m.rtTurns[foundIdx]
-				reasoningChanged := msg.ReasoningText != "" && msg.ReasoningText != t.reasoning
-				if reasoningChanged {
+				requestChanged := (msg.ReasoningText != "" && msg.ReasoningText != t.reasoning) ||
+					(msg.ContentText != "" && msg.ContentText != t.response)
+				if requestChanged {
 					if t.translating && m.rtCancel != nil {
 						m.rtCancel()
 					}
@@ -723,14 +760,14 @@ func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
 				}
 				applyFinalToTurn(t, msg)
 				t.done = false
-				if reasoningChanged {
-					if t.reasoning != "" {
+				if requestChanged {
+					if hasRTSummaryContent(t) {
 						m.rtQ = append([]int{foundIdx}, m.rtQ...)
 						cmds = append(cmds, m.startNextRT())
 					} else {
 						t.done = true
 					}
-				} else if !t.translating && t.reasoning != "" && (t.translation.Len() == 0 || t.errMsg != "") {
+				} else if !t.translating && hasRTSummaryContent(t) && (t.translation.Len() == 0 || t.errMsg != "") {
 					t.errMsg = ""
 					t.translation.Reset()
 					t.done = false
@@ -742,11 +779,11 @@ func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
 				m.debugLog = append(m.debugLog, dbgf("RT stream turn #%d finalized", foundIdx+1))
 			} else {
 				vt := newLiveTurn(len(m.rtTurns)+1, msg, false)
-				if !vt.isReasoning {
+				if !hasRTSummaryContent(vt) {
 					vt.done = true
 				}
 				m.rtTurns = append(m.rtTurns, vt)
-				if vt.isReasoning {
+				if hasRTSummaryContent(vt) {
 					idx := len(m.rtTurns) - 1
 					m.rtQ = append([]int{idx}, m.rtQ...)
 					cmds = append(cmds, m.startNextRT())
@@ -764,13 +801,16 @@ func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
 			if m.activeTab == TabHistorySessions && m.hsCursor == 0 {
 				cmds = append(cmds, m.startHSAtCursor())
 			}
+			if m.activeTab == TabRealtime {
+				m.ensureRTCursorVisible()
+			}
 			return m, tea.Batch(cmds...)
 		}
 		// Turn mode (default): existing behavior
 		vt := newLiveTurn(len(m.rtTurns)+1, msg, false)
 		m.rtTurns = append(m.rtTurns, vt)
 		idx := len(m.rtTurns) - 1
-		if vt.isReasoning {
+		if hasRTSummaryContent(vt) {
 			m.rtQ = append([]int{idx}, m.rtQ...) // live turn: priority
 		} else {
 			vt.done = true // content-only: no translation needed
@@ -794,6 +834,9 @@ func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
 		// For HS tab: only translate if currently viewing this new turn
 		if m.activeTab == TabHistorySessions && m.hsCursor == 0 {
 			cmds = append(cmds, m.startHSAtCursor())
+		}
+		if m.activeTab == TabRealtime {
+			m.ensureRTCursorVisible()
 		}
 		return m, tea.Batch(cmds...)
 
@@ -962,7 +1005,8 @@ func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
 			return m, func() tea.Msg { return BackToListMsg{} }
 		case "1":
 			m.activeTab = TabRealtime
-			m.debugLog = append(m.debugLog, dbgf("TAB switched to Reasoning"))
+			m.ensureRTCursorVisible()
+			m.debugLog = append(m.debugLog, dbgf("TAB switched to Live"))
 		case "2":
 			m.activeTab = TabHistorySessions
 			m.debugLog = append(m.debugLog, dbgf("TAB switched to Requests"))
@@ -1003,7 +1047,7 @@ func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
 			case TabRealtime:
 				if m.rtCursor < len(m.rtTurns)-1 {
 					m.rtCursor++
-					m.scrollToLatest()
+					m.ensureRTCursorVisible()
 				}
 			case TabHistorySessions:
 				if m.hsCursor < len(m.hsTurns)-1 {
@@ -1019,7 +1063,7 @@ func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
 			case TabRealtime:
 				if m.rtCursor > 0 {
 					m.rtCursor--
-					m.scrollToLatest()
+					m.ensureRTCursorVisible()
 				}
 			case TabHistorySessions:
 				if m.hsCursor > 0 {
@@ -1211,6 +1255,11 @@ func (m ViewerModel) buildTabLines(w int) []string {
 }
 
 func (m ViewerModel) buildRTLines(w int) []string {
+	lines, _, _ := m.buildRTLinesWithSelection(w)
+	return lines
+}
+
+func (m ViewerModel) buildRTLinesWithSelection(w int) ([]string, int, int) {
 	if len(m.rtTurns) == 0 {
 		modeLine := MutedStyle.Render("  Mode: [m] turn-to-turn")
 		if m.rtStreamMode {
@@ -1227,16 +1276,10 @@ func (m ViewerModel) buildRTLines(w int) []string {
 			MutedStyle.Render("  Press [m] to switch modes while waiting."),
 			MutedStyle.Render("  (New reasoning or response updates will appear here while the session is running)"),
 			"",
-		}
+		}, -1, -1
 	}
 	cursor := m.rtCursor
-	if cursor >= len(m.rtTurns) {
-		cursor = len(m.rtTurns) - 1
-	}
-	idx := len(m.rtTurns) - 1 - cursor
-	if idx < 0 {
-		idx = 0
-	}
+	idx := selectedTurnIndex(len(m.rtTurns), cursor)
 	t := m.rtTurns[idx]
 	total := len(m.rtTurns)
 
@@ -1247,8 +1290,29 @@ func (m ViewerModel) buildRTLines(w int) []string {
 		lines = append(lines, MutedStyle.Render("  Mode: [m] turn-to-turn"))
 	}
 	lines = append(lines, "")
-	lines = append(lines, buildTurnBlock(t, w, m.spinnerTick)...)
-	return lines
+
+	dividerW := w - 8
+	if dividerW < 12 {
+		dividerW = 12
+	}
+
+	selectedStart := -1
+	selectedEnd := -1
+	for i, turn := range m.rtTurns {
+		if i > 0 {
+			lines = append(lines, MutedStyle.Render("  "+strings.Repeat("─", dividerW)))
+			lines = append(lines, "")
+		}
+		blockStart := len(lines)
+		lines = append(lines, buildStackedTurnHeader(i+1, total, i == idx, turn.timestamp, w)...)
+		lines = append(lines, buildTurnBlock(turn, w, m.spinnerTick, true)...)
+		blockEnd := len(lines)
+		if i == idx {
+			selectedStart = blockStart
+			selectedEnd = blockEnd
+		}
+	}
+	return lines, selectedStart, selectedEnd
 }
 
 func (m ViewerModel) buildHSLines(w int) []string {
@@ -1256,19 +1320,13 @@ func (m ViewerModel) buildHSLines(w int) []string {
 		return []string{"", WarnStyle.Render("  No requests found for this session yet."), ""}
 	}
 	cursor := m.hsCursor
-	if cursor >= len(m.hsTurns) {
-		cursor = len(m.hsTurns) - 1
-	}
-	idx := len(m.hsTurns) - 1 - cursor
-	if idx < 0 {
-		idx = 0
-	}
+	idx := selectedTurnIndex(len(m.hsTurns), cursor)
 	t := m.hsTurns[idx]
 	total := len(m.hsTurns)
 
 	lines := buildNavBar(cursor, total, "Request", t.timestamp, w)
 	lines = append(lines, "")
-	lines = append(lines, buildTurnBlock(t, w, m.spinnerTick)...)
+	lines = append(lines, buildTurnBlock(t, w, m.spinnerTick, false)...)
 	return lines
 }
 
@@ -1340,7 +1398,73 @@ func visibleLinesFromBottom(allLines []string, height, offset int) ([]string, in
 	return visible, offset, start, end
 }
 
+func clampBottomOffsetForRange(totalLines, height, offset, rangeStart, rangeEnd int) int {
+	maxOffset := totalLines - height
+	if maxOffset < 0 {
+		maxOffset = 0
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	if offset > maxOffset {
+		offset = maxOffset
+	}
+	if totalLines == 0 || rangeStart < 0 || rangeEnd <= rangeStart {
+		return offset
+	}
+
+	if rangeEnd-rangeStart > height {
+		offset = totalLines - (rangeStart + height)
+	} else {
+		end := totalLines - offset
+		start := end - height
+		if start < 0 {
+			start = 0
+		}
+		if rangeStart < start {
+			offset = totalLines - (rangeStart + height)
+		} else if rangeEnd > end {
+			offset = totalLines - rangeEnd
+		}
+	}
+
+	if offset < 0 {
+		offset = 0
+	}
+	if offset > maxOffset {
+		offset = maxOffset
+	}
+	return offset
+}
+
+func (m *ViewerModel) ensureRTCursorVisible() {
+	if len(m.rtTurns) == 0 {
+		return
+	}
+	lines, selectedStart, selectedEnd := m.buildRTLinesWithSelection(m.panelContentWidth())
+	m.scroll[TabRealtime] = clampBottomOffsetForRange(len(lines), m.contentHeight(), m.scroll[TabRealtime], selectedStart, selectedEnd)
+}
+
 // ── Turn block builders ────────────────────────────────────────────────────────
+
+func buildStackedTurnHeader(turnNum, total int, selected bool, ts time.Time, w int) []string {
+	left := fmt.Sprintf("  Request %d / %d", turnNum, total)
+	if selected {
+		left = SelectedStyle.Render("  ▶ Request " + fmt.Sprintf("%d / %d", turnNum, total))
+	} else {
+		left = DimStyle.Render(left)
+	}
+
+	tsStr := timeAgo(ts)
+	if tsStr == "" {
+		return []string{left}
+	}
+	right := MutedStyle.Render(tsStr)
+	if pad := w - lipgloss.Width(left) - lipgloss.Width(right); pad >= 3 {
+		return []string{left + strings.Repeat(" ", pad) + right}
+	}
+	return []string{left}
+}
 
 // buildNavBar builds the navigation indicator line for single-turn views.
 // The timestamp ts is shown right-aligned if non-zero.
@@ -1394,9 +1518,9 @@ func timeAgo(t time.Time) string {
 	}
 }
 
-// buildTurnBlock builds lines for one turn. Reasoning turns get a full
-// translated block (gray); content-only turns show a compact response line.
-func buildTurnBlock(t *viewTurn, w int, spinTick int) []string {
+// buildTurnBlock builds lines for one turn. Reasoning turns get a translated
+// block; content-only turns can optionally show the raw response line.
+func buildTurnBlock(t *viewTurn, w int, spinTick int, showResponse bool) []string {
 	textMaxW := w - 6
 	if textMaxW < 20 {
 		textMaxW = 20
@@ -1412,17 +1536,22 @@ func buildTurnBlock(t *viewTurn, w int, spinTick int) []string {
 
 	lines = append(lines, "")
 
-	if t.isReasoning {
-		// Reasoning turn: full translated block in gray
+	hasTranslatedBlock := t.isReasoning || t.translation.Len() > 0 || t.translating || t.errMsg != "" || !t.done
+	if hasTranslatedBlock {
+		// Render the translated/summarized block when available or pending.
 		lines = append(lines, buildReasoningLines(t, textMaxW, spinTick)...)
-		if t.response != "" {
+		if showResponse && t.response != "" {
 			lines = append(lines, "")
 			lines = append(lines, MutedStyle.Render("  Response"))
 			lines = append(lines, buildResponseLines(t, textMaxW)...)
 		}
 	} else {
 		// Content-only turn: compact response display
-		lines = append(lines, buildResponseLines(t, textMaxW)...)
+		if showResponse {
+			lines = append(lines, buildResponseLines(t, textMaxW)...)
+		} else {
+			lines = append(lines, MutedStyle.Render("  (No reasoning summary available)"))
+		}
 	}
 	lines = append(lines, "")
 	return lines

@@ -85,6 +85,23 @@ func TestTranslateUserPromptStripsXMLAndIncludesMetadata(t *testing.T) {
 	}
 }
 
+func TestLiveRequestUserPromptIncludesAllAvailableSections(t *testing.T) {
+	prompt := LiveRequestUserPrompt("ask<hidden>x</hidden>", "think<hidden>y</hidden>", "reply", "Japanese", "translate-only")
+
+	if !strings.Contains(prompt, "User request:\nask") {
+		t.Fatalf("prompt missing user section: %q", prompt)
+	}
+	if !strings.Contains(prompt, "AI internal reasoning:\nthink") {
+		t.Fatalf("prompt missing reasoning section: %q", prompt)
+	}
+	if !strings.Contains(prompt, "AI response to user:\nreply") {
+		t.Fatalf("prompt missing response section: %q", prompt)
+	}
+	if strings.Contains(prompt, "<hidden>") || strings.Contains(prompt, "x</hidden>") || strings.Contains(prompt, "y</hidden>") {
+		t.Fatalf("prompt still contains stripped XML content: %q", prompt)
+	}
+}
+
 func TestRequestSummaryUserPromptOmitsEmptySections(t *testing.T) {
 	prompt := RequestSummaryUserPrompt("", "think<internal>drop</internal>", "reply", "Japanese", "conversational")
 
