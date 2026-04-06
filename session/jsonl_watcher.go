@@ -278,16 +278,19 @@ func (w *Watcher) processLine(line []byte, pendingUser *string, pendingReasoning
 			if ts.IsZero() {
 				ts = time.Now()
 			}
-			select {
-			case w.ch <- ReasoningMsg{
+			msg := ReasoningMsg{
 				SessionID:     w.sessionID,
 				UserMessage:   *pendingUser,
 				ReasoningText: *pendingReasoning,
 				ContentText:   *pendingContent,
 				Timestamp:     ts,
-			}:
+			}
+			// turn_end must always be delivered. Block until the viewer drains the
+			// channel (which may be full of partial messages), or watcher is stopped.
+			select {
+			case w.ch <- msg:
 				w.sendDbg(fmt.Sprintf("turn emitted (reasoning=%d, content=%d chars)", len(*pendingReasoning), len(*pendingContent)))
-			default:
+			case <-w.done:
 			}
 			*pendingReasoning = ""
 			*pendingContent = ""

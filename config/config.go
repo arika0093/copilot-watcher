@@ -12,7 +12,7 @@ type Config struct {
 }
 
 func DefaultConfig() Config {
-	return Config{Language: defaultLanguage(), Format: "conversational"}
+	return Config{Language: defaultLanguage(), Format: "translate-only"}
 }
 
 var configPathFn = configPath

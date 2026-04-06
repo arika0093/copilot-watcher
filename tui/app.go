@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"path/filepath"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -34,6 +35,10 @@ type AppModel struct {
 	sdkLogCh       chan string
 	sdkRetryCount  int
 	pendingSession *session.SessionInfo
+	// New-session dialog: non-nil while waiting for user to confirm/dismiss.
+	newSessionAlert  *session.SessionInfo
+	knownSessionIDs  map[string]bool
+	sessionIDsSeeded bool
 }
 
 // translatorReadyMsg is sent when the Copilot SDK client is initialized.
@@ -189,6 +194,18 @@ func (m AppModel) Init() tea.Cmd {
 func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	// Global keys
 	if key, ok := msg.(tea.KeyMsg); ok {
+		// New-session dialog intercepts y/n/esc before any other handler.
+		if m.newSessionAlert != nil {
+			switch key.String() {
+			case "y", "Y":
+				target := *m.newSessionAlert
+				m.newSessionAlert = nil
+				return m, m.switchToSession(target)
+			case "n", "N", "esc":
+				m.newSessionAlert = nil
+				return m, nil
+			}
+		}
 		switch key.String() {
 		case "ctrl+c":
 			return m, tea.Quit
@@ -427,6 +444,7 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	// Selector messages
 	case DetectSessionsMsg:
+		m.updateKnownSessions(msg.Sessions)
 		updated, cmd := m.selector.Update(msg)
 		m.selector = updated
 		return m, cmd
@@ -487,8 +505,87 @@ func (m AppModel) View() string {
 	if m.screen == screenSettings {
 		return m.settings.View()
 	}
+	var base string
 	if m.screen == screenViewer && m.viewer != nil {
-		return m.viewer.View()
+		base = m.viewer.View()
+	} else {
+		base = m.selector.View()
 	}
-	return m.selector.View()
+	if m.newSessionAlert != nil {
+		base = renderNewSessionBanner(m.newSessionAlert, m.width) + "\n" + base
+	}
+	return base
+}
+
+// updateKnownSessions seeds or updates knownSessionIDs and sets newSessionAlert
+// when a new active session appears while the viewer is open.
+func (m *AppModel) updateKnownSessions(sessions []session.SessionInfo) {
+	if !m.sessionIDsSeeded {
+		m.knownSessionIDs = make(map[string]bool, len(sessions))
+		for _, s := range sessions {
+			m.knownSessionIDs[s.SelectionKey()] = true
+		}
+		m.sessionIDsSeeded = true
+		return
+	}
+	for i := range sessions {
+		s := &sessions[i]
+		key := s.SelectionKey()
+		if m.knownSessionIDs[key] {
+			continue
+		}
+		m.knownSessionIDs[key] = true
+		// Only prompt while the viewer is open and the new session is active.
+		if !s.Active || m.screen != screenViewer || m.viewer == nil {
+			continue
+		}
+		if m.viewer.info.SelectionKey() == key {
+			continue
+		}
+		if m.newSessionAlert == nil {
+			m.newSessionAlert = s
+		}
+	}
+}
+
+// switchToSession closes the current viewer and opens a new one for target.
+func (m *AppModel) switchToSession(target session.SessionInfo) tea.Cmd {
+	if m.viewer != nil {
+		if m.viewer.watcher != nil {
+			m.viewer.watcher.Stop()
+		}
+		if m.viewer.rtCancel != nil {
+			m.viewer.rtCancel()
+		}
+		if m.viewer.hsCancel != nil {
+			m.viewer.hsCancel()
+		}
+		if m.viewer.haCancel != nil {
+			m.viewer.haCancel()
+		}
+	}
+	m.screen = screenViewer
+	vm := NewViewerModel(target, m.trans)
+	vm.width, vm.height = m.width, m.height
+	vm.outputLang = m.outputLang
+	vm.outputFormat = m.outputFormat
+	m.viewer = &vm
+	return tea.Batch(
+		m.viewer.Init(),
+		startViewerCmd(target, m.trans),
+	)
+}
+
+// renderNewSessionBanner renders a one-line notification bar for the new-session dialog.
+func renderNewSessionBanner(s *session.SessionInfo, width int) string {
+	id := s.SessionID
+	if len(id) > 8 {
+		id = id[:8]
+	}
+	cwd := filepath.Base(s.Cwd)
+	if len(cwd) > 24 {
+		cwd = cwd[:23] + "…"
+	}
+	text := fmt.Sprintf("  ⚡ New session started: %s  (%s)   [y] switch   [n] stay", id, cwd)
+	return WarnStyle.Width(width).Render(text)
 }

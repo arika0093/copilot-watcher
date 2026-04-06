@@ -119,6 +119,24 @@ func TestRequestSummaryUserPromptOmitsEmptySections(t *testing.T) {
 	}
 }
 
+func TestStripTranslationInputRemovesDatetimeAndXML(t *testing.T) {
+	input := "Do the thing <reminder>hidden</reminder> at 2024-06-15T08:30:00Z and done.\nCurrent time: 2024-06-15T08:30:00Z\nMore text."
+	got := StripTranslationInput(input)
+
+	if strings.Contains(got, "hidden") || strings.Contains(got, "<reminder>") {
+		t.Fatalf("StripTranslationInput should remove XML tags: %q", got)
+	}
+	if strings.Contains(got, "2024-06-15T08:30:00Z") {
+		t.Fatalf("StripTranslationInput should remove ISO datetime: %q", got)
+	}
+	if strings.Contains(got, "Current time") {
+		t.Fatalf("StripTranslationInput should remove current-time lines: %q", got)
+	}
+	if !strings.Contains(got, "Do the thing") || !strings.Contains(got, "and done") || !strings.Contains(got, "More text") {
+		t.Fatalf("StripTranslationInput removed too much content: %q", got)
+	}
+}
+
 func TestIsJapaneseLike(t *testing.T) {
 	tests := []struct {
 		lang string

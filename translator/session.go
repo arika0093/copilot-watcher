@@ -41,7 +41,7 @@ func (t *Translator) log(msg string) {
 func New(logCh chan string) (*Translator, error) {
 	t := &Translator{
 		outputLang:   "Japanese",
-		outputFormat: "conversational",
+		outputFormat: "translate-only",
 	}
 	if logCh != nil {
 		t.LogFunc = func(msg string) {

@@ -94,7 +94,11 @@ type viewTurn struct {
 	translating bool
 	done        bool
 	liveOpen    bool
-	timestamp   time.Time
+	// pendingUpdate is set in streaming mode when content is updated while a
+	// translation is already in progress. The running translation is allowed to
+	// finish; then a new one starts automatically with the accumulated content.
+	pendingUpdate bool
+	timestamp     time.Time
 }
 
 func (t *viewTurn) translationStr() string { return t.translation.String() }
@@ -713,20 +717,19 @@ func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
 			foundIdx := m.findRTTurn(msg)
 			if foundIdx >= 0 {
 				t := m.rtTurns[foundIdx]
-				requestChanged := msg.ReasoningText != "" || msg.ContentText != ""
-				if requestChanged && t.translating && m.rtCancel != nil {
-					m.rtCancel()
-				}
-				if requestChanged {
-					t.translating = false
-					t.done = false
-					t.errMsg = ""
-					t.translation.Reset()
-				}
+				contentAdded := msg.ReasoningText != "" || msg.ContentText != ""
 				applyPartialToTurn(t, msg)
-				if hasRTSummaryContent(t) && requestChanged {
-					m.rtQ = append([]int{foundIdx}, m.rtQ...)
-					cmds = append(cmds, m.startNextRT())
+				if contentAdded {
+					if t.translating {
+						// Let the running translation finish; restart after it completes.
+						t.pendingUpdate = true
+					} else {
+						t.errMsg = ""
+						t.done = false
+						t.translation.Reset()
+						m.rtQ = append([]int{foundIdx}, m.rtQ...)
+						cmds = append(cmds, m.startNextRT())
+					}
 				}
 			} else {
 				vt := newLiveTurn(len(m.rtTurns)+1, msg, true)
@@ -752,32 +755,22 @@ func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
 			foundIdx := m.findRTTurn(msg)
 			if foundIdx >= 0 {
 				t := m.rtTurns[foundIdx]
-				requestChanged := (msg.ReasoningText != "" && msg.ReasoningText != t.reasoning) ||
+				contentChanged := (msg.ReasoningText != "" && msg.ReasoningText != t.reasoning) ||
 					(msg.ContentText != "" && msg.ContentText != t.response)
-				if requestChanged {
-					if t.translating && m.rtCancel != nil {
-						m.rtCancel()
+				applyFinalToTurn(t, msg) // sets liveOpen=false
+				if t.translating {
+					if contentChanged {
+						// Let the running translation finish; restart after it completes.
+						t.pendingUpdate = true
 					}
-					t.translating = false
-					t.errMsg = ""
+					// else: current translation already covers the final content; let it finish
+				} else if hasRTSummaryContent(t) && (contentChanged || t.translation.Len() == 0 || t.errMsg != "") {
 					t.translation.Reset()
-				}
-				applyFinalToTurn(t, msg)
-				t.done = false
-				if requestChanged {
-					if hasRTSummaryContent(t) {
-						m.rtQ = append([]int{foundIdx}, m.rtQ...)
-						cmds = append(cmds, m.startNextRT())
-					} else {
-						t.done = true
-					}
-				} else if !t.translating && hasRTSummaryContent(t) && (t.translation.Len() == 0 || t.errMsg != "") {
 					t.errMsg = ""
-					t.translation.Reset()
 					t.done = false
 					m.rtQ = append([]int{foundIdx}, m.rtQ...)
 					cmds = append(cmds, m.startNextRT())
-				} else if !t.translating {
+				} else if !hasRTSummaryContent(t) {
 					t.done = true
 				}
 				m.debugLog = append(m.debugLog, dbgf("RT stream turn #%d finalized", foundIdx+1))
@@ -866,7 +859,13 @@ func (m ViewerModel) Update(msg tea.Msg) (ViewerModel, tea.Cmd) {
 		if msg.Idx < len(m.rtTurns) {
 			t := m.rtTurns[msg.Idx]
 			t.translating = false
-			if !t.liveOpen {
+			if t.pendingUpdate {
+				// New content arrived while this translation was running; restart now.
+				t.pendingUpdate = false
+				t.translation.Reset()
+				t.errMsg = ""
+				m.rtQ = append([]int{msg.Idx}, m.rtQ...)
+			} else if !t.liveOpen {
 				t.done = true
 			}
 			if t.errMsg != "" {

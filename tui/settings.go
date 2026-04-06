@@ -40,7 +40,7 @@ type fmtOption struct {
 }
 
 var formats = []fmtOption{
-	{"conversational", "Conversational", "casual summary (default)"},
+	{"conversational", "Conversational", "casual summary"},
 	{"bullets", "Bullet summary", "- key points"},
 	{"translate-only", "Translation only", "faithful, no summarizing"},
 	{"", "Custom…", "type your own instruction"},

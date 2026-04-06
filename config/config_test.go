@@ -35,8 +35,8 @@ func TestDefaultConfig(t *testing.T) {
 	if cfg.Language != "Japanese" {
 		t.Fatalf("Language = %q, want %q", cfg.Language, "Japanese")
 	}
-	if cfg.Format != "conversational" {
-		t.Fatalf("Format = %q, want %q", cfg.Format, "conversational")
+	if cfg.Format != "translate-only" {
+		t.Fatalf("Format = %q, want %q", cfg.Format, "translate-only")
 	}
 }
 
@@ -70,8 +70,8 @@ func TestLoadAppliesDefaultsToMissingFields(t *testing.T) {
 	if cfg.Language != "English" {
 		t.Fatalf("Language = %q, want %q", cfg.Language, "English")
 	}
-	if cfg.Format != "conversational" {
-		t.Fatalf("Format = %q, want %q", cfg.Format, "conversational")
+	if cfg.Format != "translate-only" {
+		t.Fatalf("Format = %q, want %q", cfg.Format, "translate-only")
 	}
 }
 

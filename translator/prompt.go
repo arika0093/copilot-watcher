@@ -12,6 +12,12 @@ var xmlTagRe = regexp.MustCompile(`(?s)<[a-zA-Z][^>]*>.*?</[a-zA-Z][^>]*>`)
 // orphanTagRe matches leftover opening or closing tags after pair stripping.
 var orphanTagRe = regexp.MustCompile(`</?[a-zA-Z][a-zA-Z0-9_:-]*(?:\s[^>]*)?>`)
 
+// isoDatetimeRe matches ISO 8601 datetime strings (e.g. 2024-01-15T09:30:00Z).
+var isoDatetimeRe = regexp.MustCompile(`\b\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?\b`)
+
+// currentTimeLineRe matches lines that primarily state the current time or date.
+var currentTimeLineRe = regexp.MustCompile(`(?im)^[^\n]*\b(?:current\s+(?:time|date)|timestamp)\b[^\n]*(\n|$)`)
+
 // StripXMLTags removes XML/HTML-like blocks (e.g. <reminder>…</reminder>,
 // <sql_tables>…</sql_tables>) that appear as internal directives in Copilot CLI
 // reasoning/context text. Iterates to handle nested structures, then strips orphans.
@@ -25,6 +31,16 @@ func StripXMLTags(text string) string {
 		s = ns
 	}
 	s = orphanTagRe.ReplaceAllString(s, "")
+	return strings.TrimSpace(s)
+}
+
+// StripTranslationInput prepares source text for translation by removing noise:
+// XML/HTML instruction blocks, "current time" annotations, and ISO 8601 timestamps.
+// Applied to all content before sending to the translation AI.
+func StripTranslationInput(text string) string {
+	s := StripXMLTags(text)
+	s = currentTimeLineRe.ReplaceAllString(s, "")
+	s = isoDatetimeRe.ReplaceAllLiteralString(s, "")
 	return strings.TrimSpace(s)
 }
 
@@ -67,7 +83,7 @@ func FormatInstruction(format string) string {
 // TranslateUserPrompt builds the user message for a real-time turn translation.
 func TranslateUserPrompt(reasoningText, lang, format string) string {
 	return fmt.Sprintf("Language: %s\nFormat: %s\nTask: Translate the following reasoning text into the target language.\n\n%s",
-		lang, FormatInstruction(format), StripXMLTags(reasoningText))
+		lang, FormatInstruction(format), StripTranslationInput(reasoningText))
 }
 
 // LiveRequestUserPrompt builds the user message for a live request update.
@@ -76,17 +92,17 @@ func LiveRequestUserPrompt(userMsg, reasoning, response, lang, format string) st
 	var sb strings.Builder
 	if userMsg != "" {
 		sb.WriteString("User request:\n")
-		sb.WriteString(StripXMLTags(userMsg))
+		sb.WriteString(StripTranslationInput(userMsg))
 		sb.WriteString("\n\n")
 	}
 	if reasoning != "" {
 		sb.WriteString("AI internal reasoning:\n")
-		sb.WriteString(StripXMLTags(reasoning))
+		sb.WriteString(StripTranslationInput(reasoning))
 		sb.WriteString("\n\n")
 	}
 	if response != "" {
 		sb.WriteString("AI response to user:\n")
-		sb.WriteString(StripXMLTags(response))
+		sb.WriteString(StripTranslationInput(response))
 	}
 	return fmt.Sprintf(
 		"Language: %s\nFormat: %s\nTask: Produce the current live request summary or translation using all available sections below. If the request is still in progress, reflect only what is currently known.\n\n%s",
@@ -98,7 +114,7 @@ func LiveRequestUserPrompt(userMsg, reasoning, response, lang, format string) st
 func SessionSummaryUserPrompt(label, reasoningText, lang, format string) string {
 	return fmt.Sprintf(
 		"Language: %s\nFormat: %s\nSession: %s\nTask: Summarize this entire Copilot CLI session as one cohesive interaction history. Focus on: (1) the main goals or requests across the session, (2) what was investigated, changed, or decided, and (3) the overall outcome. Do not summarize each turn in isolation unless the format strongly calls for it.\n\n%s",
-		lang, FormatInstruction(format), label, StripXMLTags(reasoningText),
+		lang, FormatInstruction(format), label, StripTranslationInput(reasoningText),
 	)
 }
 
@@ -108,17 +124,17 @@ func RequestSummaryUserPrompt(userMsg, reasoning, response, lang, format string)
 	var sb strings.Builder
 	if userMsg != "" {
 		sb.WriteString("User request:\n")
-		sb.WriteString(StripXMLTags(userMsg))
+		sb.WriteString(StripTranslationInput(userMsg))
 		sb.WriteString("\n\n")
 	}
 	if reasoning != "" {
 		sb.WriteString("AI internal reasoning:\n")
-		sb.WriteString(StripXMLTags(reasoning))
+		sb.WriteString(StripTranslationInput(reasoning))
 		sb.WriteString("\n\n")
 	}
 	if response != "" {
 		sb.WriteString("AI response to user:\n")
-		sb.WriteString(StripXMLTags(response))
+		sb.WriteString(StripTranslationInput(response))
 	}
 	return fmt.Sprintf(
 		"Language: %s\nFormat: %s\nTask: Summarize this Copilot CLI request. Focus on: (1) what problem or goal the user presented, (2) what the AI thought and decided, (3) what outcome or response was given. Be concise.\n\n%s",
@@ -128,7 +144,7 @@ func RequestSummaryUserPrompt(userMsg, reasoning, response, lang, format string)
 func AllSessionsUserPrompt(reasoningText, lang, format string) string {
 	return fmt.Sprintf(
 		"Language: %s\nFormat: %s\nTask: Create ONE unified summary across ALL sessions below. For each notable request, describe: (1) the problem or goal, and (2) what was done. Do NOT split by session — integrate everything into a single cohesive overview.\n\n%s",
-		lang, FormatInstruction(format), StripXMLTags(reasoningText),
+		lang, FormatInstruction(format), StripTranslationInput(reasoningText),
 	)
 }
 
