@@ -1597,7 +1597,7 @@ func buildReasoningLines(t *viewTurn, textMaxW int, spinTick int) []string {
 		lines = append(lines, ErrorStyle.Render("  ✗ API Error: "+t.errMsg))
 		return lines
 	}
-	trans := t.translationStr()
+	trans := translator.StripTranslationOutput(t.translationStr())
 	if trans == "" {
 		if t.translating {
 			spin := WarnStyle.Render(SpinnerFrames[spinTick])
@@ -1648,7 +1648,7 @@ func buildHistoryBlock(t *viewTurn, w int, spinTick int) []string {
 	}
 	lines = append(lines, ReasonStyle.Render("  "+label)+age)
 	lines = append(lines, "")
-	trans := t.translationStr()
+	trans := translator.StripTranslationOutput(t.translationStr())
 	if t.errMsg != "" {
 		lines = append(lines, ErrorStyle.Render("  ✗ API Error: "+t.errMsg))
 	} else if trans == "" {

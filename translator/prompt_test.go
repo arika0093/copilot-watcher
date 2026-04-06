@@ -155,3 +155,51 @@ func TestIsJapaneseLike(t *testing.T) {
 		}
 	}
 }
+
+func TestStripTranslationOutput(t *testing.T) {
+	tests := []struct {
+		name string
+		text string
+		want string
+	}{
+		{
+			name: "strips current_datetime XML tag",
+			text: "<current_datetime>2026-04-06T05:00:00Z</current_datetime>\n\nActual translation here.",
+			want: "Actual translation here.",
+		},
+		{
+			name: "strips English prompt header echo",
+			text: "Language: Japanese\nFormat: Translate faithfully.\nTask: Produce summary.\n\nActual translated content.",
+			want: "Actual translated content.",
+		},
+		{
+			name: "strips Japanese prompt header echo",
+			text: "言語: 日本語\n形式: 忠実に翻訳する。\nタスク: 要約を作成する。\n\n実際の翻訳内容。",
+			want: "実際の翻訳内容。",
+		},
+		{
+			name: "strips datetime + English header echo combined",
+			text: "<current_datetime>2026-04-06T05:00:00Z</current_datetime>\n\nLanguage: Japanese\nFormat: Translate faithfully.\n\nActual translation here.",
+			want: "Actual translation here.",
+		},
+		{
+			name: "leaves clean output untouched",
+			text: "Actual translation without any headers.",
+			want: "Actual translation without any headers.",
+		},
+		{
+			name: "leaves Japanese content starting with non-header",
+			text: "これは翻訳結果です。\n続きの文章。",
+			want: "これは翻訳結果です。\n続きの文章。",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := StripTranslationOutput(tt.text)
+			if got != tt.want {
+				t.Errorf("StripTranslationOutput() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}

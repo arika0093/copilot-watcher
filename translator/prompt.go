@@ -18,6 +18,10 @@ var isoDatetimeRe = regexp.MustCompile(`\b\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]
 // currentTimeLineRe matches lines that primarily state the current time or date.
 var currentTimeLineRe = regexp.MustCompile(`(?im)^[^\n]*\b(?:current\s+(?:time|date)|timestamp)\b[^\n]*(\n|$)`)
 
+// promptEchoRe detects when a model echoes back the prompt instruction header block
+// (Language:/言語: line) at the very start of its output.
+var promptEchoRe = regexp.MustCompile(`(?i)^(?:Language|言語)\s*:`)
+
 // StripXMLTags removes XML/HTML-like blocks (e.g. <reminder>…</reminder>,
 // <sql_tables>…</sql_tables>) that appear as internal directives in Copilot CLI
 // reasoning/context text. Iterates to handle nested structures, then strips orphans.
@@ -44,6 +48,24 @@ func StripTranslationInput(text string) string {
 	return strings.TrimSpace(s)
 }
 
+// StripTranslationOutput cleans AI translation output before display by removing:
+//   - System-injected XML tags (e.g. <current_datetime>…</current_datetime>) that the
+//     Copilot SDK prepends to assistant messages and that models sometimes echo back.
+//   - Echoed prompt instruction headers: when the model starts its response with
+//     "Language:" (or its translation, e.g. "言語:"), it has repeated the meta-
+//     instructions from the user prompt. In that case the header block (everything up
+//     to the first blank line) is stripped so only the actual translated content remains.
+func StripTranslationOutput(text string) string {
+	s := StripXMLTags(text)
+	s = strings.TrimSpace(s)
+	if promptEchoRe.MatchString(s) {
+		if idx := strings.Index(s, "\n\n"); idx >= 0 {
+			s = strings.TrimSpace(s[idx+2:])
+		}
+	}
+	return s
+}
+
 // RTSystemPrompt is the system message for the real-time translation session.
 func RTSystemPrompt() string {
 	return `You are an expert translator and summarizer for GitHub Copilot live request updates.
@@ -51,6 +73,7 @@ You receive the current user request, AI reasoning, and AI response content for 
 Some updates are partial while the request is still running, and some are final.
 Use only the information present in the provided update.
 Follow the language and format instructions in the user message.
+IMPORTANT: Output ONLY the translated or summarized content. Do NOT reproduce "Language:", "Format:", "Task:", or any other instruction headers in your output.
 No preamble. Output only the requested result.`
 }
 
@@ -59,6 +82,7 @@ func HistSystemPrompt() string {
 	return `You are an expert at summarizing GitHub Copilot AI coding sessions.
 You receive reasoning/thinking text from coding sessions.
 Respond ONLY with summaries in the language and format specified in the user message.
+IMPORTANT: Output ONLY the summary content. Do NOT reproduce "Language:", "Format:", "Task:", or any other instruction headers in your output.
 No preamble. No explanation. Output only the summary.`
 }
 

@@ -534,9 +534,15 @@ func (m *AppModel) updateKnownSessions(sessions []session.SessionInfo) {
 		if m.knownSessionIDs[key] {
 			continue
 		}
+		// Don't mark inactive sessions as known yet: they may transition to active
+		// shortly after (e.g. lock file created after events.jsonl). Keeping them
+		// out of the map allows the alert to fire when they become active.
+		if !s.Active {
+			continue
+		}
 		m.knownSessionIDs[key] = true
-		// Only prompt while the viewer is open and the new session is active.
-		if !s.Active || m.screen != screenViewer || m.viewer == nil {
+		// Only prompt while the viewer is open and the new session is different.
+		if m.screen != screenViewer || m.viewer == nil {
 			continue
 		}
 		if m.viewer.info.SelectionKey() == key {
