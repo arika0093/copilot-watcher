@@ -1,7 +1,7 @@
 #!/bin/sh
 set -e
 
-REPO="your-github-user/copilot-watcher"
+REPO="arika0093/copilot-watcher"
 BINARY="copilot-watcher"
 INSTALL_DIR="${HOME}/.local/bin"
 
@@ -26,6 +26,3 @@ chmod +x "${INSTALL_DIR}/${BINARY}"
 echo ""
 echo "Installed to ${INSTALL_DIR}/${BINARY}"
 echo "Make sure ${INSTALL_DIR} is in your PATH."
-echo ""
-echo "Usage:"
-echo "  ${BINARY}           # Select from running Copilot CLI sessions"
